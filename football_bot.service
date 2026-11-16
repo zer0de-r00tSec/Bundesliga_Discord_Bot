@@ -1,0 +1,17 @@
+[Unit]
+Description=Stadion-Echo Discord Bundesliga-Ticker
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+User=zer0
+WorkingDirectory=/home/zer0/football_bot_discord
+ExecStart=/home/zer0/football_bot_discord/venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=15
+# Exit 2 = Konfigurationsfehler (Token/Intent) → nicht endlos neu starten
+RestartPreventExitStatus=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
