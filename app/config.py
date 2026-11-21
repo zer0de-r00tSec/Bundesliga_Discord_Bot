@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -49,7 +50,9 @@ class Settings(BaseSettings):
     post_table_after_matchday: bool = True
     post_matchday_opener: bool = True
 
-    log_level: str = "INFO"
+    log_level: str = "INFO"          # Konsole / journalctl
+    log_file_level: str = "DEBUG"    # log/bot.log – "alles" zum Auswerten
+    log_dir: str = ""                # leer = <projekt>/log
 
     # ── Parser ───────────────────────────────────────────────────────────────
     @staticmethod
@@ -89,6 +92,12 @@ class Settings(BaseSettings):
     @property
     def all_ticker_channels(self) -> set[int]:
         return {self.ticker_channel_for(lg) for lg in self.league_list}
+
+    @property
+    def log_path(self) -> Path:
+        if self.log_dir:
+            return Path(self.log_dir).expanduser()
+        return Path(__file__).resolve().parent.parent / "log"
 
     @property
     def db_url(self) -> str:

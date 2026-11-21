@@ -65,13 +65,16 @@ CREATE TABLE IF NOT EXISTS match_events (
     FOREIGN KEY (match_id) REFERENCES matches(match_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- Spaltennamen telegram_* sind historisch; im Code: channel_id / message_id
+-- Alte Installationen (telegram_chat_id/telegram_message_id) migriert der Bot beim Start
+-- selbst (app/db.py: _migrate_posted_events). Manuell:
+--   ALTER TABLE posted_events CHANGE telegram_chat_id channel_id BIGINT NOT NULL,
+--                             CHANGE telegram_message_id message_id BIGINT NULL;
 CREATE TABLE IF NOT EXISTS posted_events (
-    event_key           VARCHAR(255) NOT NULL,
-    match_id            INT          NOT NULL,
-    telegram_chat_id    BIGINT       NOT NULL,
-    telegram_message_id BIGINT,
-    posted_at           DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event_key   VARCHAR(255) NOT NULL,
+    match_id    INT          NOT NULL,
+    channel_id  BIGINT       NOT NULL,
+    message_id  BIGINT,
+    posted_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (event_key),
     INDEX idx_match (match_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -60,6 +60,8 @@ class Publisher:
                 kwargs["content"] = content
             msg = await ch.send(**kwargs)
             self.sent += 1
+            label = embed.title or (embed.description or "")[:60]
+            logger.info("→ Discord %s: '%s' (msg %s, gesamt %d)", channel_id, label, msg.id, self.sent)
             return msg
         except discord.Forbidden:
             logger.error("Discord verweigert Senden in %s – Rechte prüfen: %s", channel_id, ", ".join(REQUIRED_PERMS))
@@ -75,6 +77,7 @@ class Publisher:
         try:
             msg = ch.get_partial_message(message_id)
             await msg.edit(embed=embed)
+            logger.debug("✎ Discord %s: msg %s editiert ('%s')", channel_id, message_id, embed.title)
             return True
         except discord.NotFound:
             logger.info("Nachricht %s nicht mehr vorhanden (gelöscht?).", message_id)

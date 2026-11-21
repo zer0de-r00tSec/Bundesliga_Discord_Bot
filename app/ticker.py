@@ -46,7 +46,9 @@ from app.timeutil import local_date_of, utcnow
 logger = logging.getLogger(__name__)
 
 FORCE_REFETCH_SECONDS = 120  # auch ohne Änderungsmarke spätestens alle 2 Min. neu laden
-TABLE_DELAY = timedelta(minutes=3)  # OpenLigaDB rechnet die Tabelle kurz nach Abpfiff neu
+TABLE_DELAY = timedelta(minutes=3)
+# Bot sieht ein laufendes Spiel erst so spät nach Anpfiff → eine Zwischenstand-Karte statt Nachholen
+LATE_JOIN = timedelta(minutes=10)  # OpenLigaDB rechnet die Tabelle kurz nach Abpfiff neu
 
 
 def goal_key(mid: int, score_key: str) -> str:
@@ -85,6 +87,10 @@ class Ticker:
         self._snaps: dict[int, MatchSnapshot] = {}
         self._conf_sig: dict[str, str] = {}
         self._scorer_known: set[str] = set()
+        # Sicherheitsnetz gegen Spam: alles, was Discord angenommen hat, wird hier gemerkt –
+        # auch wenn das Schreiben in die DB fehlschlägt. key -> (channel_id, message_id)
+        self._mem_posted: dict[str, tuple[int, int | None]] = {}
+        self._tick_no = 0
 
     # ── Steuerung ────────────────────────────────────────────────────────────
     def wake(self, full_sync: bool = False) -> None:
@@ -143,9 +149,16 @@ class Ticker:
         lead = timedelta(minutes=settings.pre_kickoff_wake_minutes)
         async with AsyncSessionLocal() as session:
             window = await get_matches_between(session, now - max_dur, now + lead + timedelta(minutes=1))
-        posted = await ev_repo.posted_keys_for([m.match_id for m in window])
+        posted = await ev_repo.posted_keys_for([m.match_id for m in window]) | set(self._mem_posted)
         active = [m for m in window if f"ft:{m.match_id}" not in posted]
         self.status.active_matches = len(active)
+        self._tick_no += 1
+        logger.debug(
+            "Tick #%d: %d Spiele im Fenster, %d aktiv (%s), %d bekannte Events",
+            self._tick_no, len(window), len(active),
+            ", ".join(f"{m.league_id}:{m.match_id}@{m.kickoff_utc:%d.%m. %H:%M}Z" for m in active) or "-",
+            len(posted),
+        )
 
         # Spieltag laden (nur wenn sich etwas geändert hat)
         groups = sorted({(m.league_id, m.season, m.matchday) for m in active})
@@ -207,19 +220,67 @@ class Ticker:
         logger.debug("Spieltag %s/%s geladen (%d Spiele, Marke %s)", league, day, len(snaps), mark)
 
     # ── Events eines Spiels ──────────────────────────────────────────────────
+    async def _remember(self, key: str, mid: int, ch: int, msg_id: int | None) -> None:
+        """Event merken: erst im Speicher (kann nicht fehlschlagen), dann in der DB."""
+        self._mem_posted[key] = (ch, msg_id)
+        try:
+            await ev_repo.mark_posted(key, mid, ch, msg_id)
+        except Exception:
+            logger.exception("DB: posted_events '%s' konnte nicht gespeichert werden – nur im Speicher gemerkt", key)
+
+    async def _already(self, key: str) -> bool:
+        if key in self._mem_posted:
+            return True
+        return await ev_repo.is_posted(key)
+
+    async def _posted_ref(self, key: str) -> tuple[int, int | None] | None:
+        """(channel_id, message_id) eines geposteten Events – Speicher vor DB."""
+        if key in self._mem_posted and self._mem_posted[key][1]:
+            return self._mem_posted[key]
+        row = await ev_repo.get_posted(key)
+        if row:
+            return (row.channel_id, row.message_id)
+        return self._mem_posted.get(key)
+
     async def _mark(self, posted: set[str], key: str, mid: int, ch: int, msg: discord.Message | None) -> None:
-        await ev_repo.mark_posted(key, mid, ch, msg.id if msg else None)
+        await self._remember(key, mid, ch, msg.id if msg else None)
         posted.add(key)
+        logger.debug("Event %s erledigt (%s)", key, "gepostet" if msg else "still markiert")
 
     async def _process_match(self, snap: MatchSnapshot, posted: set[str], now: datetime) -> None:
         mid = snap.match_id
         ch = settings.ticker_channel_for(snap.league)
         if not snap.kickoff_utc or now < snap.kickoff_utc:
             return
+        logger.debug(
+            "Match %s %s–%s: Stand %s, HZ %s, beendet=%s, Tore=%d",
+            mid, snap.home.name, snap.away.name, snap.score, snap.halftime, snap.finished, len(snap.goals),
+        )
 
         ko_key, ht_key, ft_key = f"ko:{mid}", f"ht:{mid}", f"ft:{mid}"
         # Bot hat ein Spiel erst nach Abpfiff gesehen → nicht nachträglich alles spammen
         catch_up = snap.finished and ko_key not in posted
+        # Bot steigt mitten im Spiel ein → EINE Zwischenstand-Karte, Bisheriges still markieren
+        late_join = (not snap.finished and ko_key not in posted and now - snap.kickoff_utc > LATE_JOIN)
+
+        if late_join:
+            embed = fmt.embed_match_detail(snap)
+            embed.title = f"📡 Live dabei: {snap.home.name} – {snap.away.name}"
+            msg = await self.pub.send(ch, embed)
+            if not msg:
+                return
+            await self._mark(posted, ko_key, mid, ch, msg)
+            for ev in snap.goals:
+                key = goal_key(mid, ev.score_key)
+                if key not in posted:
+                    await self._mark(posted, key, mid, ch, None)
+                    if ev.scorer:
+                        self._scorer_known.add(key)
+            if snap.halftime is not None and ht_key not in posted:
+                await self._mark(posted, ht_key, mid, ch, None)
+            logger.info("Später Einstieg %s (%s – %s, %d:%d): Zwischenstand gepostet, %d Tore still markiert",
+                        mid, snap.home.name, snap.away.name, *snap.score, len(snap.goals))
+            return
 
         # Anpfiff
         if ko_key not in posted:
@@ -230,6 +291,7 @@ class Ticker:
                 msg = await self.pub.send(ch, embed, file)
                 if msg:
                     await self._mark(posted, ko_key, mid, ch, msg)
+                    logger.info("Anpfiff %s: %s – %s", mid, snap.home.name, snap.away.name)
                 else:
                     return  # Discord-Problem → nächster Tick versucht es erneut
 
@@ -243,6 +305,7 @@ class Ticker:
                 msg = await self.pub.send(ch, fmt.embed_halftime(snap))
                 if msg:
                     await self._mark(posted, ht_key, mid, ch, msg)
+                    logger.info("Halbzeit %s: %s", mid, snap.halftime)
 
         # Abpfiff
         if snap.finished and ft_key not in posted:
@@ -300,9 +363,9 @@ class Ticker:
         stored = await ev_repo.get_event(key)
         if stored and stored.player_name:
             return
-        posted = await ev_repo.get_posted(key)
-        if posted and posted.message_id:
-            ok = await self.pub.edit(posted.channel_id or ch, posted.message_id, fmt.embed_goal(snap, ev, key))
+        ref = await self._posted_ref(key)
+        if ref and ref[1]:
+            ok = await self.pub.edit(ref[0] or ch, ref[1], fmt.embed_goal(snap, ev, key))
             if ok:
                 logger.info("Tor %s %s: Schütze nachgetragen (%s)", snap.match_id, ev.score_key, ev.scorer)
         await ev_repo.upsert_event(
@@ -330,11 +393,12 @@ class Ticker:
                 continue
             if not any(self._kickoff(m) > now for m in matches):
                 continue  # Tag schon gelaufen (z.B. Bot erst abends gestartet)
-            if await ev_repo.is_posted(key):
+            if await self._already(key):
                 continue
             msg = await self.pub.send(ch, fmt.embed_matchday_opener(matches, day))
             if msg:
-                await ev_repo.mark_posted(key, 0, ch, msg.id)
+                await self._remember(key, 0, ch, msg.id)
+                logger.info("Tagesübersicht %s in Channel %s gepostet", day, ch)
 
     def _snapshot_for(self, m: Match) -> MatchSnapshot | None:
         return self._snaps.get(m.match_id) or (parse_match(m.raw_json, m.league_id, m.season) if m.raw_json else None)
@@ -351,18 +415,20 @@ class Ticker:
             sig = repr(d)
             if self._conf_sig.get(key) == sig:
                 continue
-            existing = await ev_repo.get_posted(key)
-            if existing and existing.message_id:
-                if await self.pub.edit(ch, existing.message_id, embed):
+            existing = await self._posted_ref(key)
+            if existing and existing[1]:
+                if await self.pub.edit(ch, existing[1], embed):
                     self._conf_sig[key] = sig
+                    logger.debug("Konferenz %s aktualisiert", key)
                     continue
                 if all(s.finished for s in snaps):
                     self._conf_sig[key] = sig  # gelöscht und Tag vorbei → nicht neu posten
                     continue
             msg = await self.pub.send(ch, embed)
             if msg:
-                await ev_repo.mark_posted(key, 0, ch, msg.id)
+                await self._remember(key, 0, ch, msg.id)
                 self._conf_sig[key] = sig
+                logger.info("Konferenz %s neu gepostet (msg %s)", key, msg.id)
 
     async def _maybe_tables(self, day: date, now: datetime) -> None:
         async with AsyncSessionLocal() as session:
@@ -386,7 +452,7 @@ class Ticker:
                 continue
             ch = settings.ticker_channel_for(lg)
             key = f"table:{lg}:{day.isoformat()}"
-            if await ev_repo.is_posted(key):
+            if await self._already(key):
                 continue
             try:
                 rows = await sync_table_cache(self.client, lg, lm[0].season)
@@ -404,4 +470,5 @@ class Ticker:
                 embed.title = f"📊 Zwischenstand nach den Spielen vom {day.strftime('%d.%m.')} – {fmt.league_label(lg)}"
             msg = await self.pub.send(ch, embed)
             if msg:
-                await ev_repo.mark_posted(key, 0, ch, msg.id)
+                await self._remember(key, 0, ch, msg.id)
+                logger.info("Tabelle %s gepostet", key)

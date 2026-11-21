@@ -1,12 +1,16 @@
 """Idempotenz: posted_events (was wurde gepostet) und match_events (Tor-Details)."""
 from __future__ import annotations
 
-from sqlalchemy import delete, select
+import logging
+
+from sqlalchemy import delete, select, text
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
 from app.db import AsyncSessionLocal
 from app.models import MatchEvent, PostedEvent
 from app.timeutil import utcnow
+
+logger = logging.getLogger(__name__)
 
 
 async def get_posted(event_key: str) -> PostedEvent | None:
@@ -34,17 +38,24 @@ async def is_posted(event_key: str) -> bool:
     return await get_posted(event_key) is not None
 
 
+_MARK_SQL = text(
+    "INSERT INTO posted_events "
+    "(event_key, match_id, channel_id, message_id, posted_at) "
+    "VALUES (:k, :m, :c, :msg, :t) "
+    "ON DUPLICATE KEY UPDATE "
+    "channel_id = VALUES(channel_id), "
+    "message_id = COALESCE(VALUES(message_id), message_id)"
+)
+
+
 async def mark_posted(event_key: str, match_id: int, channel_id: int, message_id: int | None) -> None:
+    """Merkt ein gepostetes Event (Upsert; eine vorhandene message_id bleibt erhalten)."""
     async with AsyncSessionLocal() as session:
         async with session.begin():
-            stmt = mysql_insert(PostedEvent).values(
-                event_key=event_key, match_id=match_id, channel_id=channel_id,
-                message_id=message_id, posted_at=utcnow(),
-            )
-            await session.execute(stmt.on_duplicate_key_update(
-                telegram_message_id=stmt.inserted.telegram_message_id,
-                telegram_chat_id=stmt.inserted.telegram_chat_id,
-            ))
+            await session.execute(_MARK_SQL, {
+                "k": event_key, "m": match_id, "c": channel_id, "msg": message_id, "t": utcnow(),
+            })
+    logger.debug("posted_events gemerkt: %s (match %s, channel %s, msg %s)", event_key, match_id, channel_id, message_id)
 
 
 async def unmark_posted(event_keys: list[str]) -> None:

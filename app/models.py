@@ -81,18 +81,15 @@ class MatchEvent(Base):
 
 
 class PostedEvent(Base):
-    """Was wurde wohin gepostet (Idempotenz + Message-ID zum Editieren).
-
-    Die Spalten heißen aus Telegram-Zeiten noch telegram_*, im Code channel_id/message_id.
-    """
+    """Was wurde wohin gepostet (Idempotenz + Message-ID zum Editieren)."""
 
     __tablename__ = "posted_events"
     __table_args__ = (Index("idx_match", "match_id"),)
 
     event_key: Mapped[str] = mapped_column(String(255), primary_key=True)
     match_id: Mapped[int] = mapped_column(Integer)
-    channel_id: Mapped[int] = mapped_column("telegram_chat_id", BigInteger)
-    message_id: Mapped[Optional[int]] = mapped_column("telegram_message_id", BigInteger)
+    channel_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     posted_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
