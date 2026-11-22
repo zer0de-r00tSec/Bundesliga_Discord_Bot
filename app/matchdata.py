@@ -11,9 +11,14 @@ Struktur eines Spiels (gekürzt):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.timeutil import parse_api_dt
+
+# OpenLigaDB legt das "Halbzeit"-Ergebnis schon beim Anpfiff mit 0:0 an und pflegt es in der
+# 1. Hälfte als laufenden Spielstand. Eine Live-Minute gibt es nicht → Halbzeit über die Zeit.
+HALFTIME_AFTER = timedelta(minutes=50)    # 45' + Nachspielzeit + verspäteter Anstoß
+HALFTIME_LATEST = timedelta(minutes=75)   # danach läuft die 2. Hälfte längst → nicht mehr posten
 
 HALFTIME_TYPE = 1
 FINAL_TYPE = 2
@@ -237,6 +242,22 @@ def goal_events(raw: dict) -> list[GoalEvent]:
         else:
             events.append(GoalEvent(home=sh, away=sa, side=None, synthetic=True))
     return events
+
+
+def halftime_reached(snap: MatchSnapshot, now: datetime) -> bool:
+    """Ist die 1. Hälfte vorbei? Erst dann ist `snap.halftime` der echte Pausenstand."""
+    if snap.finished:
+        return snap.halftime is not None
+    if snap.halftime is None or not snap.kickoff_utc:
+        return False
+    return now - snap.kickoff_utc >= HALFTIME_AFTER
+
+
+def halftime_postable(snap: MatchSnapshot, now: datetime) -> bool:
+    """Halbzeit-Nachricht jetzt sinnvoll? (nicht zu früh, nicht mitten in der 2. Hälfte)"""
+    if snap.finished or not halftime_reached(snap, now):
+        return False
+    return now - snap.kickoff_utc <= HALFTIME_LATEST
 
 
 def parse_match(raw: dict, league_fallback: str | None = None, season_fallback: int | None = None) -> MatchSnapshot | None:

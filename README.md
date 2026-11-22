@@ -36,7 +36,7 @@ Live-Ticker für 1. und 2. Bundesliga in Discord. Datenquelle: die kostenlose
 | 🟢 Anpfiff (mit Wappen-Bild) | zur Anstoßzeit (OpenLigaDB hat keinen Live-Status → zeitbasiert) |
 | ⚽ Tor | sobald Tor oder Spielstand in der API auftaucht; Torschütze wird per **Edit nachgetragen** |
 | ⚠️ Korrektur | wenn ein Tor wieder verschwindet (VAR/Datenfehler) |
-| ⏸ Halbzeit | sobald das Halbzeitergebnis eingetragen ist |
+| ⏸ Halbzeit | 50 Min. nach Anpfiff (OpenLigaDB trägt „Halbzeit 0:0“ schon beim Anpfiff ein → zeitbasiert) |
 | 🏁 Abpfiff | mit Halbzeitstand, Zuschauern und allen Torschützen |
 | 📡 Live-Konferenz | **eine** Nachricht pro Tag, die laufend editiert wird (alle Spielstände) |
 | 📊 Tabelle | ein paar Minuten nach dem letzten Spiel des Tages je Liga |
@@ -44,6 +44,22 @@ Live-Ticker für 1. und 2. Bundesliga in Discord. Datenquelle: die kostenlose
 Alles ist idempotent (Tabelle `posted_events`): Neustarts erzeugen keine Duplikate,
 und ein Event gilt erst als gepostet, wenn Discord die Nachricht angenommen hat.
 Startet der Bot erst nach einem Spiel, wird nur der Abpfiff nachgereicht statt alles zu spammen.
+
+## Wappen
+
+Liegen in `app/assets/crests/<teamId>.png|svg`. Fehlende lädt der Bot selbst aus `teamIconUrl`
+von OpenLigaDB, wandelt sie in PNG um (SVG über cairosvg, sonst Wikimedia-Thumbnail) und behält sie:
+
+- nach jedem Saison-Sync (Start + alle `FULL_SYNC_INTERVAL_HOURS`) für alle Teams aller Ligen
+- **zum Saisonende**: Ist eine Liga durchgespielt, werden die Teams der Liga darunter geladen
+  (2. BL ← 3. Liga, 1. BL ← 2. BL, Frauen-BL ← 2. Frauen-BL – also alle möglichen Aufsteiger
+  inkl. Relegation) und, sobald OpenLigaDB ihn veröffentlicht, der Spielplan der neuen Saison.
+  So liegen die Wappen der Aufsteiger schon vor der Sommerpause bereit.
+- von Hand: `python -m tools.check_crests` (fehlende anzeigen),
+  `python -m tools.check_crests --fetch [liga …] [--season 2026] [--force]`
+
+Fehlt trotzdem eines, zeigt das Anpfiff-Bild einen Platzhalter (Kürzel im Kreis).
+Neu geladene Wappen einfach mit committen, dann sind sie auch bei einer Neuinstallation da.
 
 ## Commands
 

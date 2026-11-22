@@ -92,16 +92,47 @@ def _crest_png(team_id: int, size: int) -> bytes | None:
         return None
 
 
+def clear_cache() -> None:
+    """Nach dem Nachladen von Wappen aufrufen – sonst bleibt ein 'fehlt' im Cache hängen."""
+    _crest_png.cache_clear()
+
+
 def _crest(team_id: int, size: int) -> Image.Image | None:
     data = _crest_png(team_id, size)
     return Image.open(io.BytesIO(data)).convert("RGBA") if data else None
 
 
+_STOPWORDS = {"fc", "sv", "sc", "vfl", "vfb", "tsg", "tsv", "fsv", "bv", "sg", "spvgg", "ssv", "1.", "04", "05",
+              "07", "09", "96", "98", "e.v.", "und", "de"}
+
+
+def initials(name: str) -> str:
+    """'Energie Cottbus' → 'EC', '1. FC Kaiserslautern' → 'K', 'Hertha BSC' → 'HB'."""
+    words = [w for w in (name or "").replace("-", " ").split() if w.lower() not in _STOPWORDS]
+    letters = "".join(w[0] for w in words if w[0].isalpha())[:2].upper()
+    return letters or (name or "?")[:2].upper()
+
+
+def _placeholder(name: str, size: int) -> Image.Image:
+    """Neutrales Ersatz-Wappen: Kreis mit Kürzel."""
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    m = size // 10
+    d.ellipse([m, m, size - m, size - m], fill=(58, 58, 64, 255), outline=MID_GRAY, width=max(2, size // 60))
+    d.text((size // 2, size // 2), initials(name), font=_font(size // 3), fill=WHITE, anchor="mm")
+    return img
+
+
 def _compose(home_id, away_id, home_name, away_name, kickoff, league, size, title) -> bytes | None:
     img1, img2 = _crest(home_id, size), _crest(away_id, size)
-    if not img1 or not img2:
-        logger.info("Wappen fehlt lokal: home=%s(%s) away=%s(%s)", home_id, bool(img1), away_id, bool(img2))
+    if not img1 and not img2:
+        logger.info("Wappen fehlen lokal: home=%s away=%s – kein Bild", home_id, away_id)
         return None
+    if not img1 or not img2:
+        logger.info("Wappen fehlt lokal: home=%s(%s) away=%s(%s) – Platzhalter",
+                    home_id, bool(img1), away_id, bool(img2))
+        img1 = img1 or _placeholder(home_name, size)
+        img2 = img2 or _placeholder(away_name, size)
 
     pad, gap, text_top, info_h, divider = 36, 110, 92, 64, 12
     w = size * 2 + gap + pad * 2

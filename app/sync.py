@@ -6,6 +6,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
+from app import crests
 from app.config import CUP_LEAGUES, settings
 from app.db import AsyncSessionLocal
 from app.matchdata import MatchSnapshot, parse_match
@@ -77,6 +78,10 @@ async def sync_season(client: OpenLigaDBClient, league: str, season: int) -> int
         return 0
     await store_snapshots(snaps)
     logger.info("Season-Sync %s/%s fertig: %d Spiele", league, season, len(snaps))
+    try:
+        await crests.ensure_crests(crests.teams_from_snaps(snaps))
+    except Exception:
+        logger.exception("Wappen-Sync %s/%s fehlgeschlagen", league, season)
     return len(snaps)
 
 
@@ -127,6 +132,12 @@ async def sync_all_leagues(client: OpenLigaDBClient) -> dict[str, int]:
         await seed_aliases()
     except Exception as e:
         logger.warning("Alias-Seed fehlgeschlagen: %s", e)
+    # Saisonende: Wappen der Aufsteiger / neuen Saison schon jetzt laden
+    try:
+        await crests.prefetch_next_season(
+            client, [lg for lg in settings.league_list if lg not in CUP_LEAGUES], season)
+    except Exception:
+        logger.exception("Wappen-Vorladen für die neue Saison fehlgeschlagen")
     return result
 
 

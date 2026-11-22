@@ -289,3 +289,53 @@ def test_long_match_still_tracked_after_115_minutes(env):
     api.set(clone(a))
     run(t, store, KO + timedelta(minutes=125))
     assert "🏁 Abpfiff!" in pub.titles()
+
+
+def test_halftime_not_posted_right_after_kickoff(env):
+    """Bug 22.11.: OpenLigaDB trägt 'Halbzeit 0:0' schon beim Anpfiff ein → Halbzeit nach 3 Min."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70040, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    run(t, store, KO + timedelta(minutes=3))
+    assert "🟢 Anpfiff!" in pub.titles()
+    assert "⏸ Halbzeit" not in pub.titles() and "ht:70040" not in store.posted
+
+    # Tor in der 1. Hälfte: HZ-Ergebnis wird live mitgezogen
+    a["goals"] = [goal(1, 0, 1, 30, "Guirassy")]
+    a["matchResults"] = [result(1, 0, 1), result(2, 0, 1)]
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=31))
+    run(t, store, KO + timedelta(minutes=47))
+    assert "⏸ Halbzeit" not in pub.titles()
+
+    run(t, store, KO + timedelta(minutes=51))
+    ht = [e for _, e in pub.sent if e.title == "⏸ Halbzeit"]
+    assert len(ht) == 1 and "0 : 1" in ht[0].description
+    run(t, store, KO + timedelta(minutes=55))
+    assert len([x for x in pub.titles() if x == "⏸ Halbzeit"]) == 1
+
+
+def test_halftime_skipped_when_bot_was_down_during_break(env):
+    """Bot war in der Pause weg → keine verspätete Halbzeit mitten in der 2. Hälfte."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70041, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    run(t, store, KO + timedelta(minutes=80))
+    assert "⏸ Halbzeit" not in pub.titles() and "ht:70041" in store.posted
+
+
+def test_late_join_keeps_upcoming_halftime(env):
+    """Einstieg nach 20 Min.: Halbzeit darf nicht schon still markiert werden."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70042, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=20))
+    assert any(x.startswith("📡 Live dabei") for x in pub.titles())
+    assert "ht:70042" not in store.posted
+    run(t, store, KO + timedelta(minutes=52))
+    assert "⏸ Halbzeit" in pub.titles()

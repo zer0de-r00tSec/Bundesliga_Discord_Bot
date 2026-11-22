@@ -9,7 +9,7 @@ import discord
 from app import sprueche
 from app.config import CUP_LEAGUES, LEAGUE_NAMES, LEAGUE_SHORT
 from app.image_composer import compose_vs_image
-from app.matchdata import GoalEvent, MatchSnapshot
+from app.matchdata import GoalEvent, MatchSnapshot, halftime_reached
 from app.timeutil import aware_utc, discord_ts, fmt_local, utcnow
 
 FOOTER = "Stadion-Echo | BL-Ticker"
@@ -166,7 +166,7 @@ def embed_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = "") -> disco
         scorer = "*wird nachgetragen …*"
     e.add_field(name="🎯 Torschütze", value=scorer, inline=True)
     e.add_field(name="⏱ Minute", value=ev.minute_label if ev.minute is not None else "–", inline=True)
-    e.add_field(name="🏆", value=snap_label(snap, short=True), inline=True)
+    e.add_field(name="🏆 Wettbewerb", value=snap_label(snap), inline=True)
     return e
 
 
@@ -187,7 +187,7 @@ def embed_halftime(snap: MatchSnapshot) -> discord.Embed:
     e = _base("⏸ Halbzeit", COLOR_HT, f"*{line}*\n## {snap.home.name}  {h} : {a}  {snap.away.name}")
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
-    e.add_field(name="🏆", value=snap_label(snap, short=True), inline=False)
+    e.add_field(name="🏆 Wettbewerb", value=snap_label(snap), inline=False)
     return e
 
 
@@ -219,7 +219,7 @@ def embed_fulltime(snap: MatchSnapshot) -> discord.Embed:
         e.add_field(name="⏸ Halbzeit", value=f"{snap.halftime[0]}:{snap.halftime[1]}", inline=True)
     if snap.viewers:
         e.add_field(name="👥 Zuschauer", value=f"{snap.viewers:,}".replace(",", "."), inline=True)
-    e.add_field(name="🏆", value=snap_label(snap, short=True), inline=True)
+    e.add_field(name="🏆 Wettbewerb", value=snap_label(snap), inline=True)
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
     return e
@@ -343,10 +343,10 @@ def embed_match_detail(snap: MatchSnapshot) -> discord.Embed:
     score = f"{snap.score[0]} : {snap.score[1]}{result_suffix(snap)}" if started else "– : –"
     e = _base(f"{icon} {snap.home.name} – {snap.away.name}", COLOR_LIVE if icon == "🔴" else COLOR_DEFAULT,
               f"## {score}\n{status if started else 'Anstoß ' + discord_ts(snap.kickoff_utc, 'F')}")
-    e.add_field(name="🏆", value=snap_label(snap), inline=True)
+    e.add_field(name="🏆 Wettbewerb", value=snap_label(snap), inline=True)
     if snap.stadium:
         e.add_field(name="🏟", value=snap.stadium, inline=True)
-    if snap.halftime and started:
+    if halftime_reached(snap, now):
         e.add_field(name="⏸ HZ", value=f"{snap.halftime[0]}:{snap.halftime[1]}", inline=True)
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)

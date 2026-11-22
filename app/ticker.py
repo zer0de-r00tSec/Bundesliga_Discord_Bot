@@ -10,7 +10,7 @@ Ablauf pro Tick
        ko:{id}                    Anpfiff (zeitbasiert – OpenLigaDB kennt keinen Live-Status)
        goal:{id}:{h}-{a}          jedes Tor, später automatisch mit Schütze ergänzt (Edit)
        corr:{id}:{alt}>{neu}      Tor zurückgenommen
-       ht:{id}                    Halbzeit (sobald Halbzeitergebnis eingetragen)
+       ht:{id}                    Halbzeit (ab 50 Min. nach Anpfiff, siehe matchdata.HALFTIME_AFTER)
        ft:{id}                    Abpfiff inkl. Torschützenliste
        table:{liga}:{datum}       Tabelle nach dem letzten Spiel des Tages
        conf:{datum}:{channel}     Live-Konferenz (eine Nachricht, wird laufend editiert)
@@ -35,7 +35,7 @@ from app import formatters as fmt
 from app import sprueche
 from app.config import CUP_LEAGUES, settings
 from app.db import AsyncSessionLocal
-from app.matchdata import MatchSnapshot, parse_match
+from app.matchdata import MatchSnapshot, halftime_postable, halftime_reached, parse_match
 from app.models import Match
 from app.openligadb_client import OpenLigaDBClient
 from app.publisher import Publisher
@@ -309,7 +309,8 @@ class Ticker:
                     await self._mark(posted, key, mid, ch, None)
                     if ev.scorer:
                         self._scorer_known.add(key)
-            if snap.halftime is not None and ht_key not in posted:
+            # Halbzeit nur still markieren, wenn sie schon vorbei ist – sonst kommt sie noch regulär
+            if ht_key not in posted and halftime_reached(snap, now) and not halftime_postable(snap, now):
                 await self._mark(posted, ht_key, mid, ch, None)
             self._status(mid, p, "live")
             logger.info("Später Einstieg %s%s (%s – %s, %d:%d): Zwischenstand gepostet, %d Tore still markiert",
@@ -332,9 +333,9 @@ class Ticker:
 
         await self._process_goals(snap, posted, ch, catch_up, p)
 
-        # Halbzeit
-        if ht_key not in posted and snap.halftime is not None:
-            if snap.finished:
+        # Halbzeit – OpenLigaDB trägt "Halbzeit 0:0" schon beim Anpfiff ein, daher zeitbasiert
+        if ht_key not in posted and halftime_reached(snap, now):
+            if not halftime_postable(snap, now):  # beendet oder 2. Hälfte läuft schon lange
                 await self._mark(posted, ht_key, mid, ch, None)
             else:
                 msg = await self.pub.send(ch, fmt.embed_halftime(snap))
