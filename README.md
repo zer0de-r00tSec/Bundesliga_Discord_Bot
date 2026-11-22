@@ -34,7 +34,7 @@ Live-Ticker für 1. und 2. Bundesliga in Discord. Datenquelle: die kostenlose
 |---|---|
 | 🏟 Tagesübersicht | `PRE_KICKOFF_WAKE_MINUTES` vor dem ersten Anstoß des Tages |
 | 🟢 Anpfiff (mit Wappen-Bild) | zur Anstoßzeit (OpenLigaDB hat keinen Live-Status → zeitbasiert) |
-| ⚽ Tor | sobald Tor oder Spielstand in der API auftaucht; Torschütze wird per **Edit nachgetragen** |
+| ⚽ Tor (mit Spielstand-Karte) | sobald Tor oder Spielstand in der API auftaucht; Torschütze wird per **Edit nachgetragen** |
 | ⚠️ Korrektur | wenn ein Tor wieder verschwindet (VAR/Datenfehler) |
 | ⏸ Halbzeit | 50 Min. nach Anpfiff (OpenLigaDB trägt „Halbzeit 0:0“ schon beim Anpfiff ein → zeitbasiert) |
 | 🏁 Abpfiff | mit Halbzeitstand, Zuschauern und allen Torschützen |
@@ -44,6 +44,15 @@ Live-Ticker für 1. und 2. Bundesliga in Discord. Datenquelle: die kostenlose
 Alles ist idempotent (Tabelle `posted_events`): Neustarts erzeugen keine Duplikate,
 und ein Event gilt erst als gepostet, wenn Discord die Nachricht angenommen hat.
 Startet der Bot erst nach einem Spiel, wird nur der Abpfiff nachgereicht statt alles zu spammen.
+
+## Spielstand-Karten
+
+Mit `SCORE_CARDS=true` (Standard) kommen Tor, Halbzeit und Abpfiff als Bild: Wappen links/rechts,
+großer Spielstand (die Zahl des Torschützen- bzw. Sieger-Teams in Gold), darunter Torschütze und
+Minute bzw. alle Tore je Team, beim Abpfiff zusätzlich HZ / n.V. / i.E.
+Der Spruch bleibt als Text im Embed, der Spielstand steht im Titel (für Push-Benachrichtigungen).
+Klappt das Bild nicht, wird automatisch das klassische Text-Embed gepostet. `SCORE_CARDS=false` = nur Text.
+Testen: `/test_tor`, `/test_halbzeit`, `/test_abpfiff`, `/test_spiel`.
 
 ## Wappen
 

@@ -32,7 +32,7 @@ from datetime import date, datetime, timedelta
 import discord
 
 from app import formatters as fmt
-from app import sprueche
+from app import score_card, sprueche
 from app.config import CUP_LEAGUES, settings
 from app.db import AsyncSessionLocal
 from app.matchdata import MatchSnapshot, halftime_postable, halftime_reached, parse_match
@@ -324,6 +324,8 @@ class Ticker:
             else:
                 embed, file = await fmt.embed_kickoff(snap)
                 msg = await self.pub.send(ch, embed, file)
+                if settings.score_cards:
+                    await score_card.warm_up(snap)  # Wappen in Kartengröße vorrendern
                 if msg:
                     await self._mark(posted, ko_key, mid, ch, msg)
                     self._status(mid, p, "live")
@@ -338,14 +340,14 @@ class Ticker:
             if not halftime_postable(snap, now):  # beendet oder 2. Hälfte läuft schon lange
                 await self._mark(posted, ht_key, mid, ch, None)
             else:
-                msg = await self.pub.send(ch, fmt.embed_halftime(snap))
+                msg = await self.pub.send(ch, *await fmt.post_halftime(snap))
                 if msg:
                     await self._mark(posted, ht_key, mid, ch, msg)
                     logger.info("Halbzeit %s%s: %s", p, mid, snap.halftime)
 
         # Abpfiff
         if snap.finished and ft_key not in posted:
-            msg = await self.pub.send(ch, fmt.embed_fulltime(snap))
+            msg = await self.pub.send(ch, *await fmt.post_fulltime(snap))
             if msg:
                 await self._mark(posted, ft_key, mid, ch, msg)
                 self._status(mid, p, "ft")
@@ -387,7 +389,7 @@ class Ticker:
             if catch_up:
                 await self._mark(posted, key, mid, ch, None)
             else:
-                msg = await self.pub.send(ch, fmt.embed_goal(snap, ev, key))
+                msg = await self.pub.send(ch, *await fmt.post_goal(snap, ev, key))
                 if not msg:
                     return  # Reihenfolge wahren – nächster Tick
                 await self._mark(posted, key, mid, ch, msg)
@@ -406,7 +408,7 @@ class Ticker:
             return
         ref = await self._posted_ref(key)
         if ref and ref[1]:
-            ok = await self.pub.edit(ref[0] or ch, ref[1], fmt.embed_goal(snap, ev, key))
+            ok = await self.pub.edit(ref[0] or ch, ref[1], *await fmt.post_goal(snap, ev, key))
             if ok:
                 logger.info("Tor %s %s: Schütze nachgetragen (%s)", snap.match_id, ev.score_key, ev.scorer)
         await ev_repo.upsert_event(

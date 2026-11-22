@@ -6,8 +6,8 @@ from datetime import date, datetime
 
 import discord
 
-from app import sprueche
-from app.config import CUP_LEAGUES, LEAGUE_NAMES, LEAGUE_SHORT
+from app import score_card, sprueche
+from app.config import CUP_LEAGUES, LEAGUE_NAMES, LEAGUE_SHORT, settings
 from app.image_composer import compose_vs_image
 from app.matchdata import GoalEvent, MatchSnapshot, halftime_reached
 from app.timeutil import aware_utc, discord_ts, fmt_local, utcnow
@@ -149,7 +149,7 @@ async def embed_kickoff(snap: MatchSnapshot) -> tuple[discord.Embed, discord.Fil
     return e, file
 
 
-def embed_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = "") -> discord.Embed:
+def embed_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = "", card: bool = False) -> discord.Embed:
     team = snap.home if ev.side == "home" else snap.away if ev.side == "away" else None
     other = snap.away if team is snap.home else snap.home if team else None
     line = sprueche.pick(
@@ -158,6 +158,8 @@ def embed_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = "") -> disco
                 stand=f"{ev.home}:{ev.away}"),
     )
     title = f"⚽ TOOOR für {team.name}!" if team else "⚽ TOOOR!"
+    if card:  # Spielstand, Torschütze, Minute und Liga stehen im Bild – Stand trotzdem im Titel (Push!)
+        return _base(f"{title}  {ev.home}:{ev.away}", team_color(team.name if team else None), f"*{line}*")
     desc = f"*{line}*\n## {snap.home.name}  {ev.home} : {ev.away}  {snap.away.name}"
     e = _base(title, team_color(team.name if team else None), desc)
     if ev.scorer:
@@ -180,10 +182,12 @@ def embed_goal_correction(snap: MatchSnapshot, old: tuple[int, int], new: tuple[
     )
 
 
-def embed_halftime(snap: MatchSnapshot) -> discord.Embed:
+def embed_halftime(snap: MatchSnapshot, card: bool = False) -> discord.Embed:
     h, a = snap.halftime or snap.score
     kind = "halbzeit_nullnull" if (h, a) == (0, 0) else "halbzeit"
     line = sprueche.pick(kind, seed=f"ht{snap.match_id}", fallback="halbzeit", **_vals(snap, stand=f"{h}:{a}"))
+    if card:
+        return _base(f"⏸ Halbzeit  {snap.home.name} {h}:{a} {snap.away.name}", COLOR_HT, f"*{line}*")
     e = _base("⏸ Halbzeit", COLOR_HT, f"*{line}*\n## {snap.home.name}  {h} : {a}  {snap.away.name}")
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
@@ -191,7 +195,7 @@ def embed_halftime(snap: MatchSnapshot) -> discord.Embed:
     return e
 
 
-def embed_fulltime(snap: MatchSnapshot) -> discord.Embed:
+def embed_fulltime(snap: MatchSnapshot, card: bool = False) -> discord.Embed:
     h, a = snap.score
     win = winner_side(snap)
     if win:
@@ -214,6 +218,11 @@ def embed_fulltime(snap: MatchSnapshot) -> discord.Embed:
         extra = f"\n🥅 Elfmeterschießen **{snap.penalties[0]}:{snap.penalties[1]}** (nach Verlängerung {h}:{a})"
     elif snap.extra_time:
         extra = "\n⏱ nach Verlängerung"
+    if card:  # Stand, HZ, n.V./i.E. und alle Tore stehen im Bild
+        e = _base(f"🏁 Abpfiff  {snap.home.name} {h}:{a}{result_suffix(snap)} {snap.away.name}", color, result)
+        if snap.viewers:
+            e.add_field(name="👥 Zuschauer", value=f"{snap.viewers:,}".replace(",", "."), inline=True)
+        return e
     e = _base("🏁 Abpfiff!", color, f"## {snap.home.name}  {h} : {a}{result_suffix(snap)}  {snap.away.name}{extra}\n{result}")
     if snap.halftime:
         e.add_field(name="⏸ Halbzeit", value=f"{snap.halftime[0]}:{snap.halftime[1]}", inline=True)
@@ -223,6 +232,34 @@ def embed_fulltime(snap: MatchSnapshot) -> discord.Embed:
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
     return e
+
+
+# ── mit Spielstand-Karte (SCORE_CARDS) ───────────────────────────────────────
+
+async def _with_card(kind: str, snap: MatchSnapshot, build, ev: GoalEvent | None = None,
+                     name: str = "") -> tuple[discord.Embed, discord.File | None]:
+    """Embed + Bild. Klappt das Bild nicht (oder SCORE_CARDS=false) → klassisches Text-Embed."""
+    if settings.score_cards:
+        img = await score_card.card(kind, snap, snap_label(snap), ev)
+        if img:
+            fname = f"{name or kind}_{snap.match_id}.png"
+            e = build(True)
+            e.set_image(url=f"attachment://{fname}")
+            return e, discord.File(img, filename=fname)
+    return build(False), None
+
+
+async def post_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = ""):
+    return await _with_card("goal", snap, lambda c: embed_goal(snap, ev, event_key, card=c), ev,
+                            name=f"tor_{ev.score_key}")
+
+
+async def post_halftime(snap: MatchSnapshot):
+    return await _with_card("halftime", snap, lambda c: embed_halftime(snap, card=c), name="halbzeit")
+
+
+async def post_fulltime(snap: MatchSnapshot):
+    return await _with_card("fulltime", snap, lambda c: embed_fulltime(snap, card=c), name="abpfiff")
 
 
 def embed_matchday_opener(matches: list, day: date | None = None) -> discord.Embed:

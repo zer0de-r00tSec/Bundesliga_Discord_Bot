@@ -70,7 +70,7 @@ def _fit_logo(img: Image.Image, size: int) -> Image.Image:
     return canvas
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=256)  # Anpfiff-Bild + Karten, ~2 Größen × alle Teams des Tages
 def _crest_png(team_id: int, size: int) -> bytes | None:
     path = get_crest_path(team_id)
     if not path:

@@ -69,6 +69,8 @@ class FakePub:
     def __init__(self):
         self.sent: list[tuple[int, object]] = []
         self.edits: list[tuple[int, int, object]] = []
+        self.files: list[object] = []
+        self.edit_files: list[object] = []
         self.fail = False
         self._id = 1000
 
@@ -77,10 +79,12 @@ class FakePub:
             return None
         self._id += 1
         self.sent.append((ch, embed))
+        self.files.append(file)
         return types.SimpleNamespace(id=self._id, jump_url="x")
 
-    async def edit(self, ch, mid, embed):
+    async def edit(self, ch, mid, embed, file=None):
         self.edits.append((ch, mid, embed))
+        self.edit_files.append(file)
         return True
 
     async def check_permissions(self, ch):
@@ -152,6 +156,7 @@ def env(monkeypatch):
         return None
 
     monkeypatch.setattr(tk.fmt, "compose_vs_image", no_image)
+    monkeypatch.setattr(tk.settings, "score_cards", False)  # klassische Text-Embeds; Karten: eigene Tests
 
     def make_ticker():
         return tk.Ticker(client=api, bot=None, publisher=pub)
@@ -339,3 +344,52 @@ def test_late_join_keeps_upcoming_halftime(env):
     assert "ht:70042" not in store.posted
     run(t, store, KO + timedelta(minutes=52))
     assert "⏸ Halbzeit" in pub.titles()
+
+
+def test_score_cards_attach_image_and_keep_spruch(env, monkeypatch):
+    """SCORE_CARDS=true: Tor/Halbzeit/Abpfiff kommen mit Bild, Spruch bleibt, Stand steht im Titel."""
+    monkeypatch.setattr(tk.settings, "score_cards", True)
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70050, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    a["goals"] = [goal(1, 0, 1, 30, None)]
+    a["matchResults"] = [result(1, 0, 1), result(2, 0, 1)]
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=31))
+    goal_posts = [(e, f) for (_, e), f in zip(pub.sent, pub.files) if e.title.startswith("⚽")]
+    assert len(goal_posts) == 1
+    e, f = goal_posts[0]
+    assert e.title.endswith("0:1") and e.description.startswith("*") and not e.fields
+    assert f is not None and e.image == f"attachment://{f.filename}"
+
+    # Schütze nachgetragen → Edit bringt neues Bild mit
+    a["goals"] = [goal(1, 0, 1, 30, "Guirassy")]
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=33))
+    assert pub.edits and pub.edit_files[-1] is not None
+
+    run(t, store, KO + timedelta(minutes=51))
+    a["matchIsFinished"] = True
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=110))
+    files = {e.title.split()[0]: f for (_, e), f in zip(pub.sent, pub.files)}
+    assert files["⏸"] is not None and files["🏁"] is not None
+
+
+def test_score_cards_fall_back_to_text_on_error(env, monkeypatch):
+    monkeypatch.setattr(tk.settings, "score_cards", True)
+
+    async def broken(*a, **k):
+        return None
+
+    monkeypatch.setattr(tk.fmt.score_card, "card", broken)
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70051, 40, 7, KO, goals=[goal(1, 1, 0, 5, "Kane")], results=[result(1, 1, 0), result(2, 1, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    run(t, store, KO + timedelta(minutes=6))
+    e = next(e for _, e in pub.sent if e.title.startswith("⚽"))
+    assert "1 : 0" in e.description and any(f.name == "🎯 Torschütze" for f in e.fields)

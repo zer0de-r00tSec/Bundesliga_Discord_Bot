@@ -52,6 +52,7 @@ class Settings(BaseSettings):
 
     # Features
     conference_enabled: bool = True      # Live-Konferenz-Embed, das laufend editiert wird
+    score_cards: bool = True             # Tor/Halbzeit/Abpfiff mit Spielstand-Bild (false = nur Text)
     post_table_after_matchday: bool = True
     post_matchday_opener: bool = True
 

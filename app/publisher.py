@@ -87,13 +87,17 @@ class Publisher:
         self.failed += 1
         return None
 
-    async def edit(self, channel_id: int, message_id: int, embed: discord.Embed) -> bool:
+    async def edit(self, channel_id: int, message_id: int, embed: discord.Embed,
+                   file: discord.File | None = None) -> bool:
         ch = await self.channel(channel_id)
         if ch is None:
             return False
         try:
             msg = ch.get_partial_message(message_id)
-            await msg.edit(embed=embed)
+            if file:  # Bild ersetzen (z.B. Tor-Karte mit nachgetragenem Schützen)
+                await msg.edit(embed=embed, attachments=[file])
+            else:
+                await msg.edit(embed=embed)
             logger.debug("✎ Discord %s: msg %s editiert ('%s')", channel_id, message_id, embed.title)
             return True
         except discord.NotFound:

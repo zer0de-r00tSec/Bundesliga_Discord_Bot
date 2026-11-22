@@ -409,13 +409,15 @@ class TickerCog(commands.Cog):
                 steps.append(("Vorschau", lambda: fmt.embed_match_preview(snap)))
             steps.append(("Anpfiff", None))
             for ev in snap.goals:
-                steps.append(("Tor", lambda ev=ev: fmt.embed_goal(snap, ev, f"test{ev.score_key}")))
-            steps += [("Halbzeit", lambda: fmt.embed_halftime(snap)), ("Abpfiff", lambda: fmt.embed_fulltime(snap))]
+                steps.append(("Tor", lambda ev=ev: fmt.post_goal(snap, ev, f"test{ev.score_key}")))
+            steps += [("Halbzeit", lambda: fmt.post_halftime(snap)), ("Abpfiff", lambda: fmt.post_fulltime(snap))]
             for name, build in steps:
                 if build is None:
                     embed, file = await fmt.embed_kickoff(snap)
                 else:
-                    embed, file = build(), None
+                    res = build()
+                    res = await res if hasattr(res, "__await__") else res
+                    embed, file = res if isinstance(res, tuple) else (res, None)
                 if await post(name, ch, embed, file):
                     ok += 1
                 else:
@@ -500,7 +502,7 @@ class TickerCog(commands.Cog):
     async def cmd_test_tor(self, interaction: discord.Interaction):
         async def build(snap):
             ev = snap.goals[0] if snap.goals else GoalEvent(1, 0, "home", 23, "F. Mustermann")
-            return fmt.embed_goal(snap, ev)
+            return await fmt.post_goal(snap, ev)
 
         await self._test_post(interaction, build)
 
@@ -508,7 +510,7 @@ class TickerCog(commands.Cog):
     @admin_only()
     async def cmd_test_halbzeit(self, interaction: discord.Interaction):
         async def build(snap):
-            return fmt.embed_halftime(snap)
+            return await fmt.post_halftime(snap)
 
         await self._test_post(interaction, build)
 
@@ -516,7 +518,7 @@ class TickerCog(commands.Cog):
     @admin_only()
     async def cmd_test_abpfiff(self, interaction: discord.Interaction):
         async def build(snap):
-            return fmt.embed_fulltime(snap)
+            return await fmt.post_fulltime(snap)
 
         await self._test_post(interaction, build)
 
