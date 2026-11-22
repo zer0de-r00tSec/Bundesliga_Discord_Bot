@@ -107,3 +107,51 @@ def test_initials():
     assert image_composer.initials("Energie Cottbus") == "EC"
     assert image_composer.initials("Hertha BSC") == "HB"
     assert image_composer.initials("1. FC Kaiserslautern") == "K"
+
+
+def test_wiki_page_url_becomes_filepath():
+    assert crests.wiki_file_url(
+        "https://commons.wikimedia.org/wiki/File:Hertha_BSC_Logo_2012.svg#/media/Datei:Hertha_BSC_Logo_2012.svg"
+    ) == "https://commons.wikimedia.org/wiki/Special:FilePath/Hertha_BSC_Logo_2012.svg?width=500"
+    assert crests.wiki_file_url(
+        "https://de.wikipedia.org/wiki/Datei:SpVgg_Greuther_F%C3%BCrth_logo.svg#/media/Datei:x.svg"
+    ) == "https://de.wikipedia.org/wiki/Special:FilePath/SpVgg_Greuther_F%C3%BCrth_logo.svg?width=500"
+    assert crests.wiki_file_url("https://i.imgur.com/apFwbYZ.png") is None
+
+
+def test_html_page_is_rejected():
+    with pytest.raises(RuntimeError, match="HTML"):
+        crests.to_png(b"<!DOCTYPE html><html><body>Datei</body></html>", "x", "text/html; charset=UTF-8")
+
+
+def test_wiki_page_url_is_fetched_via_filepath(crest_dir):
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if "Special:FilePath" in str(request.url):
+            return httpx.Response(200, content=_png(500, 500), headers={"content-type": "image/png"})
+        return httpx.Response(200, content=b"<!DOCTYPE html><html></html>", headers={"content-type": "text/html"})
+
+    http = crests.new_http_client(transport=httpx.MockTransport(handler))
+    url = "https://commons.wikimedia.org/wiki/File:Logo_SC_Sand.svg#/media/Datei:Logo_SC_Sand.svg"
+    assert asyncio.run(crests.ensure_crests({8957: ("SC Sand F", url)}, http=http)) == [8957]
+    assert calls == ["https://commons.wikimedia.org/wiki/Special:FilePath/Logo_SC_Sand.svg?width=500"]
+
+
+def test_women_team_falls_back_to_club_crest(crest_dir):
+    crests._names.clear()
+    (crest_dir / "54.png").write_bytes(_png(color=(0, 0, 255, 255)))
+    http = crests.new_http_client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+    asyncio.run(crests.ensure_crests({54: ("Hertha BSC", "https://example.invalid/54.png")}, http=http))
+    new = asyncio.run(crests.ensure_crests({8963: ("Hertha BSC F", None)}, http=http))
+    assert new == [8963] and (crest_dir / "8963.png").read_bytes() == (crest_dir / "54.png").read_bytes()
+    # ohne passenden Verein bleibt es beim Fehlen
+    assert asyncio.run(crests.ensure_crests({8940: ("FSV Babelsberg F", None)}, http=http)) == []
+
+
+def test_club_name():
+    assert crests.club_name("Hertha BSC F") == "hertha bsc"
+    assert crests.club_name("Hannover 96 Frauen") == "hannover 96"
+    assert crests.club_name("VfB Stuttgart II") == "vfb stuttgart"
+    assert crests.club_name("Borussia Dortmund") == "borussia dortmund"

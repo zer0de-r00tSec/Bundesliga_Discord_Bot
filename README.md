@@ -58,7 +58,10 @@ von OpenLigaDB, wandelt sie in PNG um (SVG über cairosvg, sonst Wikimedia-Thumb
 - von Hand: `python -m tools.check_crests` (fehlende anzeigen),
   `python -m tools.check_crests --fetch [liga …] [--season 2026] [--force]`
 
-Fehlt trotzdem eines, zeigt das Anpfiff-Bild einen Platzhalter (Kürzel im Kreis).
+Links auf Wikipedia-*Dateiseiten* (`…/wiki/File:X.svg`) werden über `Special:FilePath` aufgelöst.
+Hat ein Frauen-/II-Team kein ladbares Wappen, wird das des Vereins übernommen (z.B. „Hertha BSC F“ ← „Hertha BSC“).
+Fehlt trotzdem eines, zeigt das Anpfiff-Bild einen Platzhalter (Kürzel im Kreis); eigene Datei
+`app/assets/crests/<teamId>.png` ablegen geht immer.
 Neu geladene Wappen einfach mit committen, dann sind sie auch bei einer Neuinstallation da.
 
 ## Commands

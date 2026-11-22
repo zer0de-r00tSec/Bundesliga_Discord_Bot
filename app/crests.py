@@ -45,6 +45,46 @@ REQUEST_PAUSE = 0.3              # freundlich zu Wikimedia/imgur
 LOWER_LEAGUE = {"bl1": "bl2", "bl2": "bl3", "ffb1": "ffb2"}
 
 _failed: dict[int, float] = {}
+_names: dict[str, int] = {}   # normalisierter Teamname → teamId (aus allen bisher gesehenen Teams)
+
+_TEAM_SUFFIX = re.compile(r"\s+(f|frauen|women|ii|2|u\d\d)$", re.IGNORECASE)
+
+
+def _norm(name: str) -> str:
+    return " ".join((name or "").lower().split())
+
+
+def club_name(name: str) -> str:
+    """'Hertha BSC F' / 'Hannover 96 Frauen' / 'VfB Stuttgart II' → Vereinsname."""
+    n = _norm(name)
+    while True:
+        stripped = _TEAM_SUFFIX.sub("", n)
+        if stripped == n:
+            return n
+        n = stripped
+
+
+def _copy_from_club(team_id: int, name: str) -> bool:
+    """Kein eigenes Wappen ladbar → das des Vereins (Herrenteam) übernehmen, falls vorhanden."""
+    club = club_name(name)
+    if club == _norm(name):
+        return False
+    src_id = _names.get(club)
+    src = get_crest_path(src_id) if src_id and src_id != team_id else None
+    if not src:
+        return False
+    if src.suffix.lower() == ".png":
+        png = src.read_bytes()
+    else:
+        try:
+            png = to_png(src.read_bytes(), str(src))
+        except Exception as e:
+            logger.warning("Wappen %s: Vereinswappen %s nicht umwandelbar: %s", team_id, src.name, e)
+            return False
+    CRESTS_DIR.mkdir(parents=True, exist_ok=True)
+    (CRESTS_DIR / f"{team_id}.png").write_bytes(png)
+    logger.info("Wappen %s (%s): Vereinswappen von %s (%s) übernommen", team_id, name, src_id, club)
+    return True
 _prefetch_done: set[tuple[str, int]] = set()
 
 _WIKIMEDIA = re.compile(
@@ -63,7 +103,30 @@ def wikimedia_png_url(url: str | None, width: int = 500) -> str | None:
             f"{m['a']}/{m['ab']}/{m['file']}/{width}px-{m['file']}.png")
 
 
+_WIKI_PAGE = re.compile(
+    r"^https?://(?P<host>[a-z\-]+\.(?:m\.)?wikipedia\.org|commons\.(?:m\.)?wikimedia\.org)"
+    r"/wiki/(?:File|Datei|Image|Bild|Fichier):(?P<file>[^#?]+)"
+)
+
+
+def wiki_file_url(url: str | None, width: int = 500) -> str | None:
+    """Wikipedia-/Commons-*Dateiseite* (HTML) → direkter Bild-Link über Special:FilePath.
+
+    OpenLigaDB hat manchmal 'https://commons.wikimedia.org/wiki/File:X.svg#/media/…' statt der
+    Bilddatei. Mit ?width liefert Wikimedia ein fertig gerendertes PNG (auch für SVG)."""
+    m = _WIKI_PAGE.match(url or "")
+    if not m:
+        return None
+    host = m["host"].replace(".m.", ".")
+    return f"https://{host}/wiki/Special:FilePath/{m['file']}" + (f"?width={width}" if width else "")
+
+
+_RASTER_MAGIC = (b"\x89PNG", b"GIF8", b"\xff\xd8\xff", b"RIFF", b"BM")
+
+
 def _looks_like_svg(data: bytes, url: str, content_type: str) -> bool:
+    if data.startswith(_RASTER_MAGIC):  # Inhalt schlägt Dateiendung (FilePath?width liefert PNG)
+        return False
     if "svg" in content_type.lower() or urlparse(url).path.lower().endswith(".svg"):
         return True
     head = data[:2048].lstrip().lower()
@@ -72,6 +135,9 @@ def _looks_like_svg(data: bytes, url: str, content_type: str) -> bool:
 
 def to_png(data: bytes, url: str = "", content_type: str = "") -> bytes:
     """Beliebiges Wappen-Bild → PNG mit Transparenz, längste Seite max. CREST_SIZE."""
+    head = data[:512].lstrip().lower()
+    if "html" in content_type.lower() or head.startswith((b"<!doctype html", b"<html")):
+        raise RuntimeError("HTML-Seite statt Bild")
     if _looks_like_svg(data, url, content_type):
         if cairosvg is None:
             raise RuntimeError("SVG, aber cairosvg ist nicht installiert")
@@ -89,6 +155,9 @@ def to_png(data: bytes, url: str = "", content_type: str = "") -> bytes:
 
 
 def _candidates(url: str) -> list[str]:
+    page = wiki_file_url(url)
+    if page:
+        return [page, wiki_file_url(url, width=0)]
     thumb = wikimedia_png_url(url)
     if thumb and cairosvg is None:
         return [thumb]
@@ -144,6 +213,10 @@ def missing_crests(teams: dict[int, tuple[str, str | None]]) -> list[int]:
 async def ensure_crests(teams: dict[int, tuple[str, str | None]], http: httpx.AsyncClient | None = None,
                         force: bool = False) -> list[int]:
     """Fehlende Wappen laden. Gibt die IDs der neu gespeicherten Wappen zurück."""
+    for tid, (name, _url) in teams.items():
+        n = _norm(name)
+        if n and (n == club_name(n)) and get_crest_path(tid):
+            _names.setdefault(n, tid)
     now = time.monotonic()
     todo = [tid for tid in missing_crests(teams)
             if force or now - _failed.get(tid, -RETRY_AFTER_SECONDS) >= RETRY_AFTER_SECONDS]
@@ -155,17 +228,23 @@ async def ensure_crests(teams: dict[int, tuple[str, str | None]], http: httpx.As
     try:
         for tid in todo:
             name, url = teams[tid]
-            if not url:
-                logger.warning("Wappen %s (%s): OpenLigaDB liefert keine teamIconUrl", tid, name)
-                _failed[tid] = now
-                continue
-            if await fetch_crest(http, tid, url):
+            ok = False
+            if url:
+                ok = await fetch_crest(http, tid, url)
+                await asyncio.sleep(REQUEST_PAUSE)
+                if ok:
+                    logger.info("Wappen geladen: %s (%s)", tid, name)
+                    if _norm(name) == club_name(name):
+                        _names.setdefault(_norm(name), tid)
+            if not ok:
+                ok = _copy_from_club(tid, name)
+            if ok:
                 fetched.append(tid)
                 _failed.pop(tid, None)
-                logger.info("Wappen geladen: %s (%s)", tid, name)
             else:
+                if not url:
+                    logger.warning("Wappen %s (%s): OpenLigaDB liefert keine teamIconUrl", tid, name)
                 _failed[tid] = now
-            await asyncio.sleep(REQUEST_PAUSE)
     finally:
         if own:
             await http.aclose()
