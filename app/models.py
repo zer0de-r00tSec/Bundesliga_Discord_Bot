@@ -93,6 +93,21 @@ class PostedEvent(Base):
     posted_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class MatchChannel(Base):
+    """Vom Bot angelegter Discord-Channel für genau ein Spiel."""
+
+    __tablename__ = "match_channels"
+    __table_args__ = (Index("idx_mc_league", "league_id", "season", "matchday"),)
+
+    match_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    league_id: Mapped[str] = mapped_column(String(10))
+    season: Mapped[int] = mapped_column(Integer)
+    matchday: Mapped[int] = mapped_column(Integer)
+    channel_id: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[Optional[str]] = mapped_column(String(20))   # None | live | ft
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ApiCache(Base):
     __tablename__ = "api_cache"
     cache_key: Mapped[str] = mapped_column(String(255), primary_key=True)

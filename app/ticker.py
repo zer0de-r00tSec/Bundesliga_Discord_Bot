@@ -14,6 +14,8 @@ Ablauf pro Tick
        ft:{id}                    Abpfiff inkl. Torschützenliste
        table:{liga}:{datum}       Tabelle nach dem letzten Spiel des Tages
        conf:{datum}:{channel}     Live-Konferenz (eine Nachricht, wird laufend editiert)
+     Dieselben Spiel-Events gibt es mit Präfix "mc:" für den eigenen Spiel-Channel
+     (mc:ko:{id}, mc:goal:{id}:{h}-{a}, mc:ht:{id}, mc:ft:{id} …), siehe app/channels.py.
   5. schlafen: im Spiel `poll_interval`, sonst bis kurz vor dem nächsten Anstoß.
 
 Jeder Fehler wird geloggt und der Loop läuft weiter – der Bot stürzt nicht mehr ab.
@@ -30,7 +32,8 @@ from datetime import date, datetime, timedelta
 import discord
 
 from app import formatters as fmt
-from app.config import settings
+from app import sprueche
+from app.config import CUP_LEAGUES, settings
 from app.db import AsyncSessionLocal
 from app.matchdata import MatchSnapshot, parse_match
 from app.models import Match
@@ -49,10 +52,11 @@ FORCE_REFETCH_SECONDS = 120  # auch ohne Änderungsmarke spätestens alle 2 Min.
 TABLE_DELAY = timedelta(minutes=3)
 # Bot sieht ein laufendes Spiel erst so spät nach Anpfiff → eine Zwischenstand-Karte statt Nachholen
 LATE_JOIN = timedelta(minutes=10)  # OpenLigaDB rechnet die Tabelle kurz nach Abpfiff neu
+MC = "mc:"  # Präfix für Events im Spiel-Channel
 
 
-def goal_key(mid: int, score_key: str) -> str:
-    return f"goal:{mid}:{score_key}"
+def goal_key(mid: int, score_key: str, prefix: str = "") -> str:
+    return f"{prefix}goal:{mid}:{score_key}"
 
 
 def _total_of_goal_key(key: str) -> int:
@@ -75,10 +79,12 @@ class TickerStatus:
 
 
 class Ticker:
-    def __init__(self, client: OpenLigaDBClient, bot: discord.Client, publisher: Publisher | None = None):
+    def __init__(self, client: OpenLigaDBClient, bot: discord.Client, publisher: Publisher | None = None,
+                 channels=None):
         self.client = client
         self.bot = bot
         self.pub = publisher or Publisher(bot)
+        self.channels = channels  # ChannelManager oder None (nur Konferenz)
         self.status = TickerStatus()
         self._wake = asyncio.Event()
         self._force_full_sync = False
@@ -99,6 +105,11 @@ class Ticker:
 
     async def run(self) -> None:
         await self.bot.wait_until_ready()
+        if self.channels:
+            try:
+                await self.channels.start()
+            except Exception:
+                logger.exception("Channel-Verwaltung konnte nicht starten – Ticker läuft nur in der Konferenz")
         await self.startup_checks()
         logger.info("Ticker läuft (Saison %s, Ligen %s).", settings.current_season, ",".join(settings.league_list))
         while True:
@@ -145,12 +156,19 @@ class Ticker:
             self.status.last_full_sync = now
             self._marks.clear()
 
+        if self.channels:
+            try:
+                await self.channels.prepare(now)
+            except Exception:
+                logger.exception("Spiel-Channels vorbereiten fehlgeschlagen")
+
         max_dur = timedelta(minutes=settings.match_max_duration_minutes)
         lead = timedelta(minutes=settings.pre_kickoff_wake_minutes)
         async with AsyncSessionLocal() as session:
             window = await get_matches_between(session, now - max_dur, now + lead + timedelta(minutes=1))
         posted = await ev_repo.posted_keys_for([m.match_id for m in window]) | set(self._mem_posted)
-        active = [m for m in window if f"ft:{m.match_id}" not in posted]
+        active = [m for m in window if f"ft:{m.match_id}" not in posted
+                  or (self._mc(m.match_id) and f"{MC}ft:{m.match_id}" not in posted)]
         self.status.active_matches = len(active)
         self._tick_no += 1
         logger.debug(
@@ -193,10 +211,12 @@ class Ticker:
             return max(5.0, min((nxt - now).total_seconds(), 300.0))
         async with AsyncSessionLocal() as session:
             nxt = await get_next_kickoff(session, now)
+        # mit Spiel-Channels stündlich aufwachen, damit der nächste Spieltag rechtzeitig angelegt wird
+        cap = 3600 if self.channels and self.channels.enabled else 6 * 3600
         if not nxt:
-            return 6 * 3600
+            return cap
         secs = (nxt - lead - now).total_seconds()
-        return max(30.0, min(secs, 6 * 3600))
+        return max(30.0, min(secs, cap))
 
     def _kickoff(self, m: Match) -> datetime:
         snap = self._snaps.get(m.match_id)
@@ -247,17 +267,29 @@ class Ticker:
         posted.add(key)
         logger.debug("Event %s erledigt (%s)", key, "gepostet" if msg else "still markiert")
 
+    def _mc(self, match_id: int) -> int | None:
+        return self.channels.channel_for(match_id) if self.channels else None
+
+    def _status(self, mid: int, prefix: str, status: str) -> None:
+        if prefix == MC and self.channels:
+            self.channels.mark_status(mid, status)
+
     async def _process_match(self, snap: MatchSnapshot, posted: set[str], now: datetime) -> None:
-        mid = snap.match_id
-        ch = settings.ticker_channel_for(snap.league)
         if not snap.kickoff_utc or now < snap.kickoff_utc:
             return
         logger.debug(
             "Match %s %s–%s: Stand %s, HZ %s, beendet=%s, Tore=%d",
-            mid, snap.home.name, snap.away.name, snap.score, snap.halftime, snap.finished, len(snap.goals),
+            snap.match_id, snap.home.name, snap.away.name, snap.score, snap.halftime, snap.finished, len(snap.goals),
         )
+        # 1) Konferenz-Channel der Liga, 2) eigener Spiel-Channel (falls angelegt)
+        await self._process_dest(snap, posted, now, "", settings.ticker_channel_for(snap.league))
+        mc = self._mc(snap.match_id)
+        if mc:
+            await self._process_dest(snap, posted, now, MC, mc)
 
-        ko_key, ht_key, ft_key = f"ko:{mid}", f"ht:{mid}", f"ft:{mid}"
+    async def _process_dest(self, snap: MatchSnapshot, posted: set[str], now: datetime, p: str, ch: int) -> None:
+        mid = snap.match_id
+        ko_key, ht_key, ft_key = f"{p}ko:{mid}", f"{p}ht:{mid}", f"{p}ft:{mid}"
         # Bot hat ein Spiel erst nach Abpfiff gesehen → nicht nachträglich alles spammen
         catch_up = snap.finished and ko_key not in posted
         # Bot steigt mitten im Spiel ein → EINE Zwischenstand-Karte, Bisheriges still markieren
@@ -266,20 +298,22 @@ class Ticker:
         if late_join:
             embed = fmt.embed_match_detail(snap)
             embed.title = f"📡 Live dabei: {snap.home.name} – {snap.away.name}"
+            embed.description = f"*{sprueche.pick('live_dabei')}*\n{embed.description or ''}"
             msg = await self.pub.send(ch, embed)
             if not msg:
                 return
             await self._mark(posted, ko_key, mid, ch, msg)
             for ev in snap.goals:
-                key = goal_key(mid, ev.score_key)
+                key = goal_key(mid, ev.score_key, p)
                 if key not in posted:
                     await self._mark(posted, key, mid, ch, None)
                     if ev.scorer:
                         self._scorer_known.add(key)
             if snap.halftime is not None and ht_key not in posted:
                 await self._mark(posted, ht_key, mid, ch, None)
-            logger.info("Später Einstieg %s (%s – %s, %d:%d): Zwischenstand gepostet, %d Tore still markiert",
-                        mid, snap.home.name, snap.away.name, *snap.score, len(snap.goals))
+            self._status(mid, p, "live")
+            logger.info("Später Einstieg %s%s (%s – %s, %d:%d): Zwischenstand gepostet, %d Tore still markiert",
+                        p, mid, snap.home.name, snap.away.name, *snap.score, len(snap.goals))
             return
 
         # Anpfiff
@@ -291,11 +325,12 @@ class Ticker:
                 msg = await self.pub.send(ch, embed, file)
                 if msg:
                     await self._mark(posted, ko_key, mid, ch, msg)
-                    logger.info("Anpfiff %s: %s – %s", mid, snap.home.name, snap.away.name)
+                    self._status(mid, p, "live")
+                    logger.info("Anpfiff %s%s: %s – %s", p, mid, snap.home.name, snap.away.name)
                 else:
                     return  # Discord-Problem → nächster Tick versucht es erneut
 
-        await self._process_goals(snap, posted, ch, catch_up)
+        await self._process_goals(snap, posted, ch, catch_up, p)
 
         # Halbzeit
         if ht_key not in posted and snap.halftime is not None:
@@ -305,18 +340,20 @@ class Ticker:
                 msg = await self.pub.send(ch, fmt.embed_halftime(snap))
                 if msg:
                     await self._mark(posted, ht_key, mid, ch, msg)
-                    logger.info("Halbzeit %s: %s", mid, snap.halftime)
+                    logger.info("Halbzeit %s%s: %s", p, mid, snap.halftime)
 
         # Abpfiff
         if snap.finished and ft_key not in posted:
             msg = await self.pub.send(ch, fmt.embed_fulltime(snap))
             if msg:
                 await self._mark(posted, ft_key, mid, ch, msg)
-                logger.info("Abpfiff %s: %s %d:%d %s", mid, snap.home.name, *snap.score, snap.away.name)
+                self._status(mid, p, "ft")
+                logger.info("Abpfiff %s%s: %s %d:%d %s", p, mid, snap.home.name, *snap.score, snap.away.name)
 
-    async def _process_goals(self, snap: MatchSnapshot, posted: set[str], ch: int, catch_up: bool) -> None:
+    async def _process_goals(self, snap: MatchSnapshot, posted: set[str], ch: int, catch_up: bool,
+                             p: str = "") -> None:
         mid = snap.match_id
-        prefix = f"goal:{mid}:"
+        prefix = f"{p}goal:{mid}:"
         announced = [k for k in posted if k.startswith(prefix)]
         announced_max = max((_total_of_goal_key(k) for k in announced), default=0)
         current_total = sum(snap.score)
@@ -326,7 +363,7 @@ class Ticker:
             too_high = [k for k in announced if _total_of_goal_key(k) > current_total]
             old = max(too_high, key=_total_of_goal_key).rsplit(":", 1)[1]
             new = f"{snap.score[0]}-{snap.score[1]}"
-            corr_key = f"corr:{mid}:{old}>{new}"
+            corr_key = f"{p}corr:{mid}:{old}>{new}"
             if corr_key not in posted:
                 oh, oa = (int(x) for x in old.split("-"))
                 msg = await self.pub.send(ch, fmt.embed_goal_correction(snap, (oh, oa), snap.score))
@@ -334,9 +371,12 @@ class Ticker:
                     await self._mark(posted, corr_key, mid, ch, msg)
             await ev_repo.unmark_posted(too_high)  # gleicher Stand später wieder → neu melden
             posted.difference_update(too_high)
+            for k in too_high:  # auch aus dem Speicher-Netz, sonst wird das Tor nie wieder gemeldet
+                self._mem_posted.pop(k, None)
+                self._scorer_known.discard(k)
 
         for ev in snap.goals:
-            key = goal_key(mid, ev.score_key)
+            key = goal_key(mid, ev.score_key, p)
             team_id = snap.home.id if ev.side == "home" else snap.away.id if ev.side == "away" else None
             if key in posted:
                 if ev.scorer and key not in self._scorer_known:
@@ -350,7 +390,7 @@ class Ticker:
                 if not msg:
                     return  # Reihenfolge wahren – nächster Tick
                 await self._mark(posted, key, mid, ch, msg)
-                logger.info("Tor %s: %s %s (%s)", mid, ev.score_key, ev.scorer or "?", ev.minute_label)
+                logger.info("Tor %s%s: %s %s (%s)", p, mid, ev.score_key, ev.scorer or "?", ev.minute_label)
             await ev_repo.upsert_event(
                 key, mid, "goal", minute=ev.minute, home_score=ev.home, away_score=ev.away,
                 player_name=ev.scorer, team_id=team_id,
@@ -441,6 +481,8 @@ class Ticker:
         for m in matches:
             by_lg.setdefault(m.league_id, []).append(m)
         for lg, lm in by_lg.items():
+            if lg in CUP_LEAGUES:
+                continue  # Pokal hat keine Tabelle
             rows_lg = [ft_by_match.get(m.match_id) for m in lm]
             if not all(rows_lg):
                 continue

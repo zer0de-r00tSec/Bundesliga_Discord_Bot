@@ -33,6 +33,23 @@ class Publisher:
         self._cache[channel_id] = ch
         return ch
 
+    async def delete(self, channel_id: int, message_id: int) -> bool:
+        ch = await self.channel(channel_id)
+        if ch is None:
+            return False
+        try:
+            await ch.get_partial_message(message_id).delete()
+            return True
+        except discord.NotFound:
+            return True
+        except discord.HTTPException as e:
+            logger.warning("Löschen von %s in %s fehlgeschlagen: %s", message_id, channel_id, e)
+            return False
+
+    def forget(self, channel_id: int) -> None:
+        """Channel aus dem Cache werfen (z.B. nach dem Löschen)."""
+        self._cache.pop(channel_id, None)
+
     async def check_permissions(self, channel_id: int) -> list[str]:
         """Gibt fehlende Rechte zurück (leere Liste = alles ok)."""
         ch = await self.channel(channel_id)

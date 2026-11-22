@@ -3,7 +3,8 @@
 Struktur eines Spiels (gekürzt):
   matchID, matchDateTimeUTC, matchIsFinished, leagueShortcut, leagueSeason,
   group{groupOrderID, groupName}, team1/team2{teamId, teamName, shortName, teamIconUrl},
-  matchResults[{resultTypeID (1=Halbzeit, 2=Endergebnis), pointsTeam1, pointsTeam2, resultName}],
+  matchResults[{resultTypeID (1=Halbzeit, 2=nach 90 Min., 4=nach Verlängerung, 5=Elfmeterschießen),
+                pointsTeam1, pointsTeam2, resultName}],
   goals[{goalID, scoreTeam1, scoreTeam2, matchMinute, goalGetterName, isPenalty, isOwnGoal, isOvertime}],
   location{locationCity, locationStadium}, lastUpdateDateTime
 """
@@ -16,6 +17,9 @@ from app.timeutil import parse_api_dt
 
 HALFTIME_TYPE = 1
 FINAL_TYPE = 2
+EXTRA_TIME_TYPE = 4
+PENALTY_TYPE = 5
+CUP_SHORTCUTS = {"dfb", "dfbf"}
 
 
 @dataclass
@@ -82,6 +86,8 @@ class MatchSnapshot:
     has_score_data: bool
     halftime: tuple[int, int] | None
     goals: list[GoalEvent] = field(default_factory=list)
+    extra_time: bool = False                      # Spiel ging in die Verlängerung
+    penalties: tuple[int, int] | None = None      # Ergebnis Elfmeterschießen
     stadium: str | None = None
     city: str | None = None
     viewers: int | None = None
@@ -114,12 +120,26 @@ def halftime_result(raw: dict) -> tuple[int, int] | None:
 
 
 def final_result(raw: dict) -> tuple[int, int] | None:
-    return _result(raw, FINAL_TYPE)
+    """Endstand aus dem Spiel (nach Verlängerung, falls es eine gab – ohne Elfmeterschießen)."""
+    return _result(raw, EXTRA_TIME_TYPE) or _result(raw, FINAL_TYPE)
+
+
+def penalty_result(raw: dict) -> tuple[int, int] | None:
+    return _result(raw, PENALTY_TYPE)
+
+
+def _is_shootout_goal(raw: dict, g: dict) -> bool:
+    """Elfmeterschießen-'Tore' stehen in goals[] mit laufendem Zähler, ohne Minute.
+    Sie zählen nicht zum Spielstand."""
+    if not g.get("isPenalty") or _int(g.get("matchMinute")) is not None:
+        return False
+    cup = (raw.get("leagueShortcut") or "").lower() in CUP_SHORTCUTS
+    return cup or penalty_result(raw) is not None
 
 
 def _sorted_goals(raw: dict) -> list[dict]:
     goals = [g for g in (raw.get("goals") or []) if _int(g.get("scoreTeam1")) is not None
-             and _int(g.get("scoreTeam2")) is not None]
+             and _int(g.get("scoreTeam2")) is not None and not _is_shootout_goal(raw, g)]
     return sorted(
         goals,
         key=lambda g: (
@@ -242,6 +262,9 @@ def parse_match(raw: dict, league_fallback: str | None = None, season_fallback: 
         has_score_data=has,
         halftime=halftime_result(raw),
         goals=goal_events(raw),
+        extra_time=_result(raw, EXTRA_TIME_TYPE) is not None
+        or any(bool(g.get("isOvertime")) for g in _sorted_goals(raw)),
+        penalties=penalty_result(raw),
         stadium=loc.get("locationStadium"),
         city=loc.get("locationCity"),
         viewers=_int(raw.get("numberOfViewers")),

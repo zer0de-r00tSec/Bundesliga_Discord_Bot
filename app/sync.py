@@ -6,7 +6,7 @@ import logging
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-from app.config import settings
+from app.config import CUP_LEAGUES, settings
 from app.db import AsyncSessionLocal
 from app.matchdata import MatchSnapshot, parse_match
 from app.models import ApiCache, Match, Team, TeamAlias
@@ -117,6 +117,8 @@ async def sync_all_leagues(client: OpenLigaDBClient) -> dict[str, int]:
         except Exception as e:
             logger.error("Season-Sync %s fehlgeschlagen: %s", league, e)
             result[league] = -1
+        if league in CUP_LEAGUES:
+            continue  # Pokal: keine Tabelle
         try:
             await sync_table_cache(client, league, season)
         except Exception as e:
@@ -179,12 +181,19 @@ async def seed_aliases() -> int:
     if not teams:
         return 0
     names = {t.id: t.name.lower() for t in teams}
+    # Herren-Teams bevorzugen: "fcb" soll FC Bayern sein, nicht die Frauenmannschaft
+    async with AsyncSessionLocal() as session:
+        mens = set((await session.execute(
+            select(Match.home_team_id).where(Match.league_id.in_(("bl1", "bl2", "bl3", "dfb")))
+        )).scalars().all())
     count = 0
     async with AsyncSessionLocal() as session:
         async with session.begin():
             for alias, term in MANUAL_ALIASES.items():
                 # nur eindeutige Teilstring-Treffer (Teams anderer Ligen fehlen in der DB)
                 hits = [tid for tid, n in names.items() if term in n]
+                if len(hits) > 1:
+                    hits = [tid for tid in hits if tid in mens] or hits
                 if len(hits) != 1:
                     continue
                 best = hits[0]

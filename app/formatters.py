@@ -2,13 +2,12 @@
 Listen-Embeds ORM-Matches aus der DB."""
 from __future__ import annotations
 
-import random
 from datetime import date, datetime
-from pathlib import Path
 
 import discord
 
-from app.config import LEAGUE_NAMES, LEAGUE_SHORT
+from app import sprueche
+from app.config import CUP_LEAGUES, LEAGUE_NAMES, LEAGUE_SHORT
 from app.image_composer import compose_vs_image
 from app.matchdata import GoalEvent, MatchSnapshot
 from app.timeutil import aware_utc, discord_ts, fmt_local, utcnow
@@ -40,25 +39,22 @@ TEAM_COLORS: list[tuple[str, int]] = [
     ("regensburg", 0xD40511), ("dresden", 0xFFD400), ("münster", 0x00843D),
 ]
 
-GOAL_LINES_FILE = Path(__file__).resolve().parent / "assets" / "goal_lines.txt"
-DEFAULT_GOAL_LINES = [
-    "Der Keeper hatte keine Chance!", "Was für ein Einschlag!", "Eiskalt vollendet!",
-    "Das Stadion bebt!", "Unhaltbar ins Eck!", "Da ist das Ding drin!",
-]
-OPENERS = [
-    "Der Rasen ist bereit. Bist du es? ⚽",
-    "Die Kurve brennt. Es geht los! 🔥",
-    "Heute wird Fußball gespielt – alles andere ist egal. 🏟️",
-    "Anpfiff naht. Hol dir ein Kaltgetränk. 🍺",
-]
+def _vals(snap: MatchSnapshot, **extra) -> dict:
+    v = {"heim": snap.home.name, "gast": snap.away.name, "stand": f"{snap.score[0]}:{snap.score[1]}"}
+    v.update(extra)
+    return v
 
 
-def _goal_lines() -> list[str]:
-    try:
-        lines = [l.strip() for l in GOAL_LINES_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
-        return lines or DEFAULT_GOAL_LINES
-    except OSError:
-        return DEFAULT_GOAL_LINES
+def goal_kind(ev: GoalEvent) -> str:
+    if ev.own_goal:
+        return "eigentor"
+    if ev.penalty:
+        return "elfmeter"
+    if ev.minute is not None and ev.minute >= 85:
+        return "spaet"
+    if ev.home == ev.away:
+        return "ausgleich"
+    return "tor"
 
 
 def team_color(team_name: str | None, default: int = COLOR_GOAL) -> int:
@@ -69,9 +65,33 @@ def team_color(team_name: str | None, default: int = COLOR_GOAL) -> int:
     return default
 
 
-def league_label(league: str, matchday: int | None = None, short: bool = False) -> str:
+def league_label(league: str, matchday: int | None = None, short: bool = False, group_name: str | None = None) -> str:
     name = (LEAGUE_SHORT if short else LEAGUE_NAMES).get(league, league.upper())
+    if league in CUP_LEAGUES:  # Pokal: "2. Runde", "Achtelfinale" … statt Spieltag
+        return f"{name} · {group_name}" if group_name else name
     return f"{name} · {matchday}. Spieltag" if matchday else name
+
+
+def snap_label(snap: MatchSnapshot, short: bool = False) -> str:
+    return league_label(snap.league, snap.matchday, short, snap.group_name)
+
+
+def result_suffix(snap: MatchSnapshot) -> str:
+    """' i.E.' / ' n.V.' hinter dem Endstand (nur Pokal relevant)."""
+    if not snap.finished:
+        return ""
+    if snap.penalties:
+        return " i.E."
+    return " n.V." if snap.extra_time else ""
+
+
+def winner_side(snap: MatchSnapshot) -> str | None:
+    h, a = snap.score
+    if h != a:
+        return "home" if h > a else "away"
+    if snap.penalties and snap.penalties[0] != snap.penalties[1]:
+        return "home" if snap.penalties[0] > snap.penalties[1] else "away"
+    return None
 
 
 def _cut(text: str, limit: int) -> str:
@@ -109,13 +129,14 @@ def goals_summary(snap: MatchSnapshot, limit: int = 1024) -> str:
 
 async def embed_kickoff(snap: MatchSnapshot) -> tuple[discord.Embed, discord.File | None]:
     ko_local = fmt_local(snap.kickoff_utc, "%d.%m.%Y %H:%M")
+    line = sprueche.pick("anpfiff", seed=f"ko{snap.match_id}", **_vals(snap))
     e = _base(
         "🟢 Anpfiff!",
         COLOR_KICKOFF,
-        f"## {snap.home.name} – {snap.away.name}",
+        f"*{line}*\n## {snap.home.name} – {snap.away.name}",
         snap.kickoff_utc,
     )
-    e.add_field(name="🏆 Wettbewerb", value=league_label(snap.league, snap.matchday), inline=True)
+    e.add_field(name="🏆 Wettbewerb", value=snap_label(snap), inline=True)
     if snap.stadium or snap.city:
         e.add_field(name="🏟 Stadion", value=" · ".join(x for x in (snap.stadium, snap.city) if x), inline=True)
     img = await compose_vs_image(
@@ -130,7 +151,12 @@ async def embed_kickoff(snap: MatchSnapshot) -> tuple[discord.Embed, discord.Fil
 
 def embed_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = "") -> discord.Embed:
     team = snap.home if ev.side == "home" else snap.away if ev.side == "away" else None
-    line = random.Random(event_key or f"{snap.match_id}{ev.score_key}").choice(_goal_lines())
+    other = snap.away if team is snap.home else snap.home if team else None
+    line = sprueche.pick(
+        goal_kind(ev), seed=event_key or f"{snap.match_id}{ev.score_key}", fallback="tor",
+        **_vals(snap, team=team.name if team else "", gegner=other.name if other else "",
+                stand=f"{ev.home}:{ev.away}"),
+    )
     title = f"⚽ TOOOR für {team.name}!" if team else "⚽ TOOOR!"
     desc = f"*{line}*\n## {snap.home.name}  {ev.home} : {ev.away}  {snap.away.name}"
     e = _base(title, team_color(team.name if team else None), desc)
@@ -140,7 +166,7 @@ def embed_goal(snap: MatchSnapshot, ev: GoalEvent, event_key: str = "") -> disco
         scorer = "*wird nachgetragen …*"
     e.add_field(name="🎯 Torschütze", value=scorer, inline=True)
     e.add_field(name="⏱ Minute", value=ev.minute_label if ev.minute is not None else "–", inline=True)
-    e.add_field(name="🏆", value=league_label(snap.league, snap.matchday, short=True), inline=True)
+    e.add_field(name="🏆", value=snap_label(snap, short=True), inline=True)
     return e
 
 
@@ -150,33 +176,50 @@ def embed_goal_correction(snap: MatchSnapshot, old: tuple[int, int], new: tuple[
         COLOR_WARN,
         f"{snap.home.name} – {snap.away.name}\n"
         f"Spielstand korrigiert: ~~{old[0]}:{old[1]}~~ → **{new[0]}:{new[1]}**\n"
-        f"*(VAR-Entscheidung oder Datenkorrektur)*",
+        f"*{sprueche.pick('korrektur', seed=f'corr{snap.match_id}{old}', **_vals(snap))}*",
     )
 
 
 def embed_halftime(snap: MatchSnapshot) -> discord.Embed:
     h, a = snap.halftime or snap.score
-    e = _base("⏸ Halbzeit", COLOR_HT, f"## {snap.home.name}  {h} : {a}  {snap.away.name}")
+    kind = "halbzeit_nullnull" if (h, a) == (0, 0) else "halbzeit"
+    line = sprueche.pick(kind, seed=f"ht{snap.match_id}", fallback="halbzeit", **_vals(snap, stand=f"{h}:{a}"))
+    e = _base("⏸ Halbzeit", COLOR_HT, f"*{line}*\n## {snap.home.name}  {h} : {a}  {snap.away.name}")
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
-    e.add_field(name="🏆", value=league_label(snap.league, snap.matchday, short=True), inline=False)
+    e.add_field(name="🏆", value=snap_label(snap, short=True), inline=False)
     return e
 
 
 def embed_fulltime(snap: MatchSnapshot) -> discord.Embed:
     h, a = snap.score
-    if h > a:
-        result, color = f"🏆 **{snap.home.name}** gewinnt!", team_color(snap.home.name, COLOR_FT)
-    elif a > h:
-        result, color = f"🏆 **{snap.away.name}** gewinnt!", team_color(snap.away.name, COLOR_FT)
+    win = winner_side(snap)
+    if win:
+        team = snap.home if win == "home" else snap.away
+        loser = snap.away if win == "home" else snap.home
+        result, color = f"🏆 **{team.name}** gewinnt!", team_color(team.name, COLOR_FT)
+        kind = "abpfiff_sieg"
+        if snap.league in CUP_LEAGUES:
+            result, kind = f"🏆 **{team.name}** ist eine Runde weiter!", "pokal_weiter"
+        if h + a >= 5:
+            kind = "abpfiff_torfest"
+        vals = _vals(snap, sieger=team.name, verlierer=loser.name)
     else:
         result, color = "🤝 Unentschieden!", COLOR_FT
-    e = _base("🏁 Abpfiff!", color, f"## {snap.home.name}  {h} : {a}  {snap.away.name}\n{result}")
+        kind = "abpfiff_nullnull" if h + a == 0 else "abpfiff_torfest" if h + a >= 6 else "abpfiff_remis"
+        vals = _vals(snap, sieger="", verlierer="")
+    result += f"\n*{sprueche.pick(kind, seed=f'ft{snap.match_id}', fallback='abpfiff_remis', **vals)}*"
+    extra = ""
+    if snap.penalties:
+        extra = f"\n🥅 Elfmeterschießen **{snap.penalties[0]}:{snap.penalties[1]}** (nach Verlängerung {h}:{a})"
+    elif snap.extra_time:
+        extra = "\n⏱ nach Verlängerung"
+    e = _base("🏁 Abpfiff!", color, f"## {snap.home.name}  {h} : {a}{result_suffix(snap)}  {snap.away.name}{extra}\n{result}")
     if snap.halftime:
         e.add_field(name="⏸ Halbzeit", value=f"{snap.halftime[0]}:{snap.halftime[1]}", inline=True)
     if snap.viewers:
         e.add_field(name="👥 Zuschauer", value=f"{snap.viewers:,}".replace(",", "."), inline=True)
-    e.add_field(name="🏆", value=league_label(snap.league, snap.matchday, short=True), inline=True)
+    e.add_field(name="🏆", value=snap_label(snap, short=True), inline=True)
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
     return e
@@ -186,7 +229,7 @@ def embed_matchday_opener(matches: list, day: date | None = None) -> discord.Emb
     title = "🏟 Spieltag – Los geht's!"
     if day:
         title = f"🏟 Fußball am {day.strftime('%d.%m.%Y')} – Los geht's!"
-    e = _base(title, COLOR_DEFAULT, random.choice(OPENERS))
+    e = _base(title, COLOR_DEFAULT, sprueche.pick("tagesstart"))
     leagues: dict[str, list] = {}
     for m in matches:
         leagues.setdefault(m.league_id, []).append(m)
@@ -195,7 +238,8 @@ def embed_matchday_opener(matches: list, day: date | None = None) -> discord.Emb
             f"{discord_ts(m.kickoff_utc, 't')} · {_nm(m.home_team)} – {_nm(m.away_team)}"
             for m in sorted(lm, key=lambda x: x.kickoff_utc)
         ]
-        e.add_field(name=f"🏆 {league_label(lg, lm[0].matchday)}", value=_cut("\n".join(lines), 1024), inline=False)
+        e.add_field(name=f"🏆 {league_label(lg, lm[0].matchday, group_name=getattr(lm[0], 'group_name', None))}",
+                    value=_cut("\n".join(lines), 1024), inline=False)
     return e
 
 
@@ -211,6 +255,8 @@ def _live_status(snap: MatchSnapshot, now: datetime) -> tuple[str, str]:
     if elapsed <= 62 and (snap.halftime or elapsed <= 60):
         return "⏸", "HZ"
     minute = elapsed - 15
+    if snap.league in CUP_LEAGUES and minute > 97 and snap.score[0] == snap.score[1]:
+        return "🔴", "Verl." if minute <= 135 else "11m"
     return "🔴", f"~{min(minute, 90)}'" if minute <= 90 else "90+"
 
 
@@ -228,13 +274,13 @@ def embed_conference(snaps: list[MatchSnapshot], day: date, now: datetime | None
         for s in sorted(items, key=lambda x: (x.kickoff_utc or now, x.match_id)):
             icon, status = _live_status(s, now)
             started = s.kickoff_utc and s.kickoff_utc <= now
-            score = f"**{s.score[0]}:{s.score[1]}**" if started else "– : –"
+            score = f"**{s.score[0]}:{s.score[1]}**{result_suffix(s)}" if started else "– : –"
             line = f"{icon} `{status:>5}` {_nm(s.home, True)} {score} {_nm(s.away, True)}"
             if started and s.goals and not s.finished:
                 g = s.goals[-1]
                 line += f" · ⚽ {g.scorer or '?'} {g.minute_label if g.minute is not None else ''}".rstrip()
             lines.append(line)
-        e.add_field(name=f"🏆 {league_label(lg, items[0].matchday)}", value=_cut("\n".join(lines), 1024), inline=False)
+        e.add_field(name=f"🏆 {snap_label(items[0])}", value=_cut("\n".join(lines), 1024), inline=False)
     return e
 
 
@@ -294,14 +340,29 @@ def embed_match_detail(snap: MatchSnapshot) -> discord.Embed:
     now = utcnow()
     icon, status = _live_status(snap, now)
     started = snap.kickoff_utc and snap.kickoff_utc <= now
-    score = f"{snap.score[0]} : {snap.score[1]}" if started else "– : –"
+    score = f"{snap.score[0]} : {snap.score[1]}{result_suffix(snap)}" if started else "– : –"
     e = _base(f"{icon} {snap.home.name} – {snap.away.name}", COLOR_LIVE if icon == "🔴" else COLOR_DEFAULT,
               f"## {score}\n{status if started else 'Anstoß ' + discord_ts(snap.kickoff_utc, 'F')}")
-    e.add_field(name="🏆", value=league_label(snap.league, snap.matchday), inline=True)
+    e.add_field(name="🏆", value=snap_label(snap), inline=True)
     if snap.stadium:
         e.add_field(name="🏟", value=snap.stadium, inline=True)
     if snap.halftime and started:
         e.add_field(name="⏸ HZ", value=f"{snap.halftime[0]}:{snap.halftime[1]}", inline=True)
     if snap.goals:
         e.add_field(name="⚽ Tore", value=goals_summary(snap), inline=False)
+    return e
+
+
+def embed_match_preview(snap: MatchSnapshot) -> discord.Embed:
+    """Erste Nachricht in einem frisch angelegten Spiel-Channel."""
+    e = _base(
+        f"📅 {snap.home.name} – {snap.away.name}",
+        COLOR_DEFAULT,
+        f"*{sprueche.pick('vorschau', seed=f'pre{snap.match_id}', **_vals(snap))}*\n"
+        f"Anstoß {discord_ts(snap.kickoff_utc, 'F')} ({discord_ts(snap.kickoff_utc, 'R')})\n"
+        f"Hier laufen Anpfiff, Tore, Halbzeit und Endstand **dieses** Spiels live.",
+    )
+    e.add_field(name="🏆 Wettbewerb", value=snap_label(snap), inline=True)
+    if snap.stadium or snap.city:
+        e.add_field(name="🏟 Stadion", value=" · ".join(x for x in (snap.stadium, snap.city) if x), inline=True)
     return e
