@@ -18,6 +18,11 @@ Ablauf pro Tick
      (mc:ko:{id}, mc:goal:{id}:{h}-{a}, mc:ht:{id}, mc:ft:{id} …), siehe app/channels.py.
   5. schlafen: im Spiel `poll_interval`, sonst bis kurz vor dem nächsten Anstoß.
 
+Zwischenspeicher gegen API-Aussetzer (`_guard`): Liefert OpenLigaDB plötzlich weniger Tore, keine
+Ergebnisse oder einen älteren Datenstand, bleibt der letzte gute Stand stehen (auch in der DB), bis die
+Antwort sich DOWNGRADE_CONFIRMATIONS-mal bestätigt. Der Pausenstand wird in der Pause live mitgeschrieben
+(match_events "htscore:{id}") – das "Halbzeit"-Ergebnis der API bleibt live oft auf 0:0 stehen.
+
 Jeder Fehler wird geloggt und der Loop läuft weiter – der Bot stürzt nicht mehr ab.
 Ein Event gilt nur dann als gepostet, wenn Discord die Nachricht wirklich angenommen hat.
 """
@@ -35,7 +40,10 @@ from app import formatters as fmt
 from app import score_card, sprueche
 from app.config import CUP_LEAGUES, settings
 from app.db import AsyncSessionLocal
-from app.matchdata import MatchSnapshot, halftime_postable, halftime_reached, parse_match
+from app.matchdata import (
+    HALFTIME_AFTER, HALFTIME_CAPTURE_UNTIL, MatchSnapshot, halftime_postable, halftime_reached,
+    merge_halftime, parse_match,
+)
 from app.models import Match
 from app.openligadb_client import OpenLigaDBClient
 from app.publisher import Publisher
@@ -53,6 +61,33 @@ TABLE_DELAY = timedelta(minutes=3)
 # Bot sieht ein laufendes Spiel erst so spät nach Anpfiff → eine Zwischenstand-Karte statt Nachholen
 LATE_JOIN = timedelta(minutes=10)  # OpenLigaDB rechnet die Tabelle kurz nach Abpfiff neu
 MC = "mc:"  # Präfix für Events im Spiel-Channel
+# Ein niedrigerer Spielstand / fehlende Daten müssen so oft hintereinander kommen, bevor wir sie glauben
+# (sonst hält der letzte gute Stand – OpenLigaDB liefert zwischendurch gern mal Müll)
+DOWNGRADE_CONFIRMATIONS = 2
+
+
+def ht_score_key(mid: int) -> str:
+    """match_events-Schlüssel für den live mitgeschriebenen Pausenstand."""
+    return f"htscore:{mid}"
+
+
+def _richness(s: MatchSnapshot) -> int:
+    return len(s.goals) + len(s.raw.get("matchResults") or [])
+
+
+def _is_downgrade(old: MatchSnapshot, new: MatchSnapshot) -> str | None:
+    """Warum `new` schlechter aussieht als `old` (oder None, wenn alles plausibel ist)."""
+    if old.finished and not new.finished:
+        return "Spiel plötzlich nicht mehr beendet"
+    if old.last_update and new.last_update and new.last_update < old.last_update:
+        return f"älterer Datenstand ({new.last_update} < {old.last_update})"
+    if old.has_score_data and not new.has_score_data:
+        return "keine Ergebnisdaten mehr"
+    if sum(new.score) < sum(old.score) and _richness(new) < _richness(old):
+        return f"Stand {old.score} → {new.score} mit weniger Daten"
+    if sum(new.score) < sum(old.score):
+        return f"Stand {old.score} → {new.score}"
+    return None
 
 
 def goal_key(mid: int, score_key: str, prefix: str = "") -> str:
@@ -97,6 +132,10 @@ class Ticker:
         # auch wenn das Schreiben in die DB fehlschlägt. key -> (channel_id, message_id)
         self._mem_posted: dict[str, tuple[int, int | None]] = {}
         self._tick_no = 0
+        self._suspect: dict[int, int] = {}                 # match_id -> Anzahl verdächtiger Antworten in Folge
+        self._ht_live: dict[int, tuple[int, int]] = {}     # live mitgeschriebener Pausenstand
+        self._ht_loaded: set[int] = set()
+        self._ht_posted: dict[str, tuple[int, int]] = {}   # ht-Event-Key -> gezeigter Stand (für Korrektur-Edit)
 
     # ── Steuerung ────────────────────────────────────────────────────────────
     def wake(self, full_sync: bool = False) -> None:
@@ -188,6 +227,7 @@ class Ticker:
             if snap is None:
                 continue
             try:
+                await self._apply_halftime(snap, now)  # auch ohne neuen Abruf (Pausenfenster beginnt)
                 await self._process_match(snap, posted, now)
             except Exception:
                 logger.exception("Verarbeitung von Match %s fehlgeschlagen", m.match_id)
@@ -229,15 +269,83 @@ class Ticker:
         if key in self._marks and mark is not None and mark == self._marks[key] and not stale:
             return
         try:
-            snaps = await sync_matchday(self.client, league, season, day)
+            snaps = await sync_matchday(self.client, league, season, day, guard=self._guard)
         except Exception as e:
-            logger.warning("Spieltag %s/%s/%s nicht ladbar: %s", league, season, day, e)
+            logger.warning("Spieltag %s/%s/%s nicht ladbar: %s – letzter Stand bleibt", league, season, day, e)
             return
         self._marks[key] = mark
         self._last_fetch[key] = time.monotonic()
         for s in snaps:
+            await self._apply_halftime(s, now)
             self._snaps[s.match_id] = s
         logger.debug("Spieltag %s/%s geladen (%d Spiele, Marke %s)", league, day, len(snaps), mark)
+
+    def _guard(self, snaps: list[MatchSnapshot]) -> list[MatchSnapshot]:
+        """Zwischenspeicher gegen API-Aussetzer: schlechtere Daten erst nach Bestätigung übernehmen.
+
+        Wird vor dem Schreiben in die DB aufgerufen, damit auch /befehle den letzten guten Stand sehen.
+        """
+        out = []
+        for new in snaps:
+            old = self._snaps.get(new.match_id)
+            why = _is_downgrade(old, new) if old else None
+            if not why:
+                self._suspect.pop(new.match_id, None)
+                out.append(new)
+                continue
+            n = self._suspect.get(new.match_id, 0) + 1
+            if n >= DOWNGRADE_CONFIRMATIONS:
+                logger.warning("Match %s: %s – %d× bestätigt, übernehme neuen Stand", new.match_id, why, n)
+                self._suspect.pop(new.match_id, None)
+                out.append(new)
+            else:
+                self._suspect[new.match_id] = n
+                logger.warning("Match %s: API-Antwort verdächtig (%s) – behalte letzten Stand", new.match_id, why)
+                out.append(old)
+        return out
+
+    async def _apply_halftime(self, snap: MatchSnapshot, now: datetime) -> None:
+        """Pausenstand absichern: in der Pause den Live-Stand mitschreiben (Speicher + DB).
+
+        OpenLigaDB lässt "Halbzeit" gern auf 0:0 stehen. Zwischen 50' und 60' nach Anstoß ist Pause –
+        was dann als Spielstand gemeldet wird, IST der Pausenstand. Nach einem Neustart kommt er aus der DB.
+        """
+        mid = snap.match_id
+        if mid not in self._ht_live and mid not in self._ht_loaded:
+            self._ht_loaded.add(mid)
+            try:
+                row = await ev_repo.get_event(ht_score_key(mid))
+            except Exception:
+                logger.exception("DB: Pausenstand %s nicht ladbar", mid)
+                row = None
+            if row and row.home_score is not None and row.away_score is not None:
+                self._ht_live[mid] = (row.home_score, row.away_score)
+
+        if snap.kickoff_utc and not snap.finished and snap.has_score_data:
+            elapsed = now - snap.kickoff_utc
+            if HALFTIME_AFTER <= elapsed <= HALFTIME_CAPTURE_UNTIL:
+                seen = merge_halftime(self._ht_live.get(mid), snap.score, score=snap.score)
+                if seen != self._ht_live.get(mid):
+                    logger.info("Match %s: Pausenstand live gemerkt %s:%s", mid, *seen)
+                    await self._store_ht(mid, seen)
+
+        if mid in self._ht_live:
+            live = self._ht_live[mid]
+            merged = merge_halftime(live, snap.halftime, score=snap.score)
+            if merged != snap.halftime:
+                logger.debug("Match %s: Pausenstand API %s → %s", mid, snap.halftime, merged)
+            snap.halftime = merged
+            if snap.has_score_data and (live[0] > snap.score[0] or live[1] > snap.score[1]) and merged:
+                # Tor vor der Pause wurde zurückgenommen (VAR) → gemerkten Stand nicht später wiederbeleben
+                logger.info("Match %s: Pausenstand %s:%s zurückgenommen → %s:%s", mid, *live, *merged)
+                await self._store_ht(mid, merged)
+
+    async def _store_ht(self, mid: int, ht: tuple[int, int]) -> None:
+        self._ht_live[mid] = ht
+        try:
+            await ev_repo.upsert_event(ht_score_key(mid), mid, "halftime", home_score=ht[0], away_score=ht[1])
+        except Exception:
+            logger.exception("DB: Pausenstand %s nicht gespeichert – nur im Speicher", mid)
 
     # ── Events eines Spiels ──────────────────────────────────────────────────
     async def _remember(self, key: str, mid: int, ch: int, msg_id: int | None) -> None:
@@ -343,7 +451,14 @@ class Ticker:
                 msg = await self.pub.send(ch, *await fmt.post_halftime(snap))
                 if msg:
                     await self._mark(posted, ht_key, mid, ch, msg)
+                    self._ht_posted[ht_key] = snap.halftime or snap.score
                     logger.info("Halbzeit %s%s: %s", p, mid, snap.halftime)
+        elif ht_key in self._ht_posted and snap.halftime and snap.halftime != self._ht_posted[ht_key]:
+            # Tor kurz vor der Pause kam erst nach dem Halbzeit-Post in der API an → Nachricht korrigieren
+            ref = await self._posted_ref(ht_key)
+            if ref and ref[1] and await self.pub.edit(ref[0] or ch, ref[1], *await fmt.post_halftime(snap)):
+                logger.info("Halbzeit %s%s korrigiert: %s → %s", p, mid, self._ht_posted[ht_key], snap.halftime)
+            self._ht_posted[ht_key] = snap.halftime
 
         # Abpfiff
         if snap.finished and ft_key not in posted:

@@ -85,8 +85,13 @@ async def sync_season(client: OpenLigaDBClient, league: str, season: int) -> int
     return len(snaps)
 
 
-async def sync_matchday(client: OpenLigaDBClient, league: str, season: int, day: int) -> list[MatchSnapshot]:
+async def sync_matchday(client: OpenLigaDBClient, league: str, season: int, day: int,
+                        guard=None) -> list[MatchSnapshot]:
+    """Spieltag laden und speichern. `guard(snaps) -> snaps` kann verdächtige Antworten vorher
+    durch den letzten guten Stand ersetzen (siehe Ticker._guard)."""
     snaps = parse_all(await client.get_matchday(league, season, day), league, season)
+    if guard:
+        snaps = guard(snaps)
     await store_snapshots(snaps)
     return snaps
 

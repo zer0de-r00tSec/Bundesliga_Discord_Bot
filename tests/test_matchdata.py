@@ -1,4 +1,4 @@
-from app.matchdata import current_score, goal_events, parse_match
+from app.matchdata import current_score, goal_events, halftime_result, merge_halftime, parse_match
 from tests.fixtures import goal, live_match, match, result
 
 
@@ -100,3 +100,20 @@ def test_sprueche_yaml_valid_and_used():
     assert e1.description == e2.description  # gleicher Spruch beim Editieren
     assert "{" not in e1.description
     assert "Max" in sprueche.pick("willkommen", name="Max")
+
+
+def test_halftime_from_goals_beats_stale_api_value():
+    raw = match(goals=[goal(1, 1, 0, 20, "A"), goal(2, 1, 1, 45, "B"), goal(3, 2, 1, 60, "C")],
+                results=[result(1, 0, 0), result(2, 2, 1)])
+    assert halftime_result(raw) == (1, 1)
+
+
+def test_halftime_api_value_kept_when_goal_minutes_missing():
+    raw = match(goals=[goal(1, 1, 0, None, None)], results=[result(1, 1, 0), result(2, 1, 0)])
+    assert halftime_result(raw) == (1, 0)
+
+
+def test_merge_halftime_never_above_score():
+    assert merge_halftime((2, 0), (1, 0), score=(1, 0)) == (1, 0)
+    assert merge_halftime(None, (0, 0), score=(0, 0)) == (0, 0)
+    assert merge_halftime(None, None) is None

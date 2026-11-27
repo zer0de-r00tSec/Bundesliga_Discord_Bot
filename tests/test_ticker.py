@@ -114,8 +114,10 @@ def env(monkeypatch):
             home_team=types.SimpleNamespace(name=snap.home.name), away_team=types.SimpleNamespace(name=snap.away.name),
         )
 
-    async def sync_matchday(client, lg, season, day):
+    async def sync_matchday(client, lg, season, day, guard=None):
         snaps = parse_all([r for r in api.raws.values() if r["group"]["groupOrderID"] == day], lg, season)
+        if guard:
+            snaps = guard(snaps)
         for s in snaps:
             db[s.match_id] = to_row(s)
         return snaps
@@ -225,7 +227,9 @@ def test_full_matchday(env):
     a["matchResults"] = [result(1, 1, 0)]
     api.set(clone(a))
     run(t, store, KO + timedelta(minutes=70))
-    assert pub.titles()[-1].startswith("⚠️ Korrektur")
+    assert not pub.titles()[-1].startswith("⚠️ Korrektur")  # einmalig niedriger → könnte API-Aussetzer sein
+    run(t, store, KO + timedelta(minutes=71))
+    assert pub.titles()[-1].startswith("⚠️ Korrektur")      # bestätigt → Korrektur
     a["goals"].append(goal(3, 1, 1, 75, "Adeyemi"))
     api.set(clone(a))
     before = len(pub.sent)
@@ -393,3 +397,99 @@ def test_score_cards_fall_back_to_text_on_error(env, monkeypatch):
     run(t, store, KO + timedelta(minutes=6))
     e = next(e for _, e in pub.sent if e.title.startswith("⚽"))
     assert "1 : 0" in e.description and any(f.name == "🎯 Torschütze" for f in e.fields)
+
+
+def _ht_embeds(pub):
+    return [e for _, e in pub.sent if e.title == "⏸ Halbzeit"]
+
+
+def test_halftime_uses_real_score_when_api_keeps_0_0(env):
+    """Bug 27.11.: OpenLigaDB lässt 'Halbzeit' live auf 0:0 stehen → Post zeigte immer 0:0."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70050, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    a["goals"] = [goal(1, 1, 0, 12, "Kane"), goal(2, 2, 0, 38, "Musiala")]
+    a["matchResults"] = [result(1, 0, 0), result(2, 2, 0)]   # HZ bleibt stur 0:0
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=40))
+    run(t, store, KO + timedelta(minutes=51))
+    ht = _ht_embeds(pub)
+    assert len(ht) == 1 and "2 : 0" in ht[0].description
+
+    # 2. Hälfte: Tor danach ändert den Pausenstand nicht, Abpfiff zeigt HZ 2:0
+    a["goals"].append(goal(3, 2, 1, 70, "Guirassy"))
+    a["matchResults"] = [result(1, 0, 0), result(2, 2, 1)]
+    a["matchIsFinished"] = True
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=112))
+    ft = [e for _, e in pub.sent if e.title == "🏁 Abpfiff!"][0]
+    assert any(f.value == "2:0" for f in ft.fields if "Halbzeit" in f.name)
+
+
+def test_halftime_from_live_score_without_goal_minutes(env):
+    """Tore ohne Minute + HZ 0:0 → Pausenstand aus dem Live-Stand in der Pause, übersteht Neustart."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70051, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    a["goals"] = [goal(1, 0, 1, None, None)]
+    a["matchResults"] = [result(1, 0, 0), result(2, 0, 1)]
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=30))
+    run(t, store, KO + timedelta(minutes=52))
+    assert "0 : 1" in _ht_embeds(pub)[0].description
+    assert (store.events["htscore:70051"].home_score, store.events["htscore:70051"].away_score) == (0, 1)
+
+    # Bot-Neustart in der 2. Hälfte, dann 1:1 und Abpfiff → HZ kommt aus der DB
+    a["goals"] = [goal(1, 0, 1, None, None), goal(2, 1, 1, None, None)]
+    a["matchResults"] = [result(1, 0, 0), result(2, 1, 1)]
+    a["matchIsFinished"] = True
+    api.set(clone(a))
+    t2 = env.make()
+    run(t2, store, KO + timedelta(minutes=112))
+    ft = [e for _, e in pub.sent if e.title == "🏁 Abpfiff!"][0]
+    assert any(f.value == "0:1" for f in ft.fields if "Halbzeit" in f.name)
+
+
+def test_api_hiccup_keeps_last_good_state(env):
+    """Einmal leere/kaputte Antwort: kein falsches 'Tor zurückgenommen', Stand bleibt stehen."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70052, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    a["goals"], a["matchResults"] = [goal(1, 1, 0, 10, "Kane")], [result(1, 1, 0), result(2, 1, 0)]
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=11))
+    broken = clone(a)
+    broken["goals"], broken["matchResults"] = [], []
+    api.set(broken)
+    run(t, store, KO + timedelta(minutes=12))
+    assert not any(x.startswith("⚠️") for x in pub.titles())
+    assert t._snaps[70052].score == (1, 0)
+    assert env.db[70052].raw_json["goals"]  # DB hat den guten Stand behalten
+    api.set(clone(a))  # API wieder gesund
+    run(t, store, KO + timedelta(minutes=13))
+    assert not any(x.startswith("⚠️") for x in pub.titles()) and t._snaps[70052].score == (1, 0)
+    assert len([x for x in pub.titles() if x.startswith("⚽")]) == 1
+
+
+def test_late_first_half_goal_corrects_halftime_post(env):
+    """45+3-Tor kommt erst nach dem Halbzeit-Post in der API an → Halbzeit-Nachricht wird editiert."""
+    api, pub, store = env.api, env.pub, env.store
+    a = match(70053, 40, 7, KO, results=[result(1, 0, 0), result(2, 0, 0)])
+    api.set(clone(a))
+    t = env.make()
+    run(t, store, KO + timedelta(minutes=1))
+    run(t, store, KO + timedelta(minutes=50))
+    assert "0 : 0" in _ht_embeds(pub)[0].description
+    a["goals"] = [goal(1, 1, 0, 45, "Kane")]
+    a["matchResults"] = [result(1, 0, 0), result(2, 1, 0)]
+    api.set(clone(a))
+    run(t, store, KO + timedelta(minutes=53))
+    edited = [e for _, _, e in pub.edits if getattr(e, "title", None) == "⏸ Halbzeit"]
+    assert edited and "1 : 0" in edited[-1].description
+    assert len(_ht_embeds(pub)) == 1
