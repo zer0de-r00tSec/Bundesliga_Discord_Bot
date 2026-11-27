@@ -15,10 +15,14 @@ from datetime import datetime, timedelta
 
 from app.timeutil import parse_api_dt
 
-# OpenLigaDB legt das "Halbzeit"-Ergebnis schon beim Anpfiff mit 0:0 an und pflegt es in der
-# 1. Hälfte als laufenden Spielstand. Eine Live-Minute gibt es nicht → Halbzeit über die Zeit.
+# OpenLigaDB legt das "Halbzeit"-Ergebnis schon beim Anpfiff mit 0:0 an – und pflegt es live oft
+# gar nicht (bleibt 0:0, bis das Spiel längst vorbei ist). Eine Live-Minute gibt es nicht →
+# Halbzeit über die Zeit; der Pausenstand wird aus Toren + live mitgeschriebenem Stand bestimmt.
 HALFTIME_AFTER = timedelta(minutes=50)    # 45' + Nachspielzeit + verspäteter Anstoß
 HALFTIME_LATEST = timedelta(minutes=75)   # danach läuft die 2. Hälfte längst → nicht mehr posten
+# Bis hierhin ist Pause (2. Hälfte frühestens ~62' nach Anstoß) → Live-Stand == Pausenstand
+HALFTIME_CAPTURE_UNTIL = timedelta(minutes=60)
+FIRST_HALF_LAST_MINUTE = 45               # OpenLigaDB führt Nachspielzeit der 1. HZ als 45'
 
 HALFTIME_TYPE = 1
 FINAL_TYPE = 2
@@ -121,7 +125,44 @@ def _result(raw: dict, type_id: int) -> tuple[int, int] | None:
 
 
 def halftime_result(raw: dict) -> tuple[int, int] | None:
-    return _result(raw, HALFTIME_TYPE)
+    """Pausenstand: API-Wert und aus den Toren abgeleiteter Stand, der plausiblere gewinnt."""
+    return merge_halftime(_result(raw, HALFTIME_TYPE), halftime_from_goals(raw), score=current_score(raw)[0])
+
+
+def halftime_from_goals(raw: dict) -> tuple[int, int] | None:
+    """Stand nach dem letzten Tor bis zur 45. Minute. None, wenn es dafür keine Tor-Minuten gibt."""
+    goals = _sorted_goals(raw)
+    if not goals:
+        return None
+    best: tuple[int, int] = (0, 0)
+    for g in goals:
+        minute = _int(g.get("matchMinute"))
+        if minute is None:
+            return None  # Minute fehlt → Zuordnung zur Halbzeit unklar
+        if minute <= FIRST_HALF_LAST_MINUTE and not g.get("isOvertime"):
+            h, a = _int(g["scoreTeam1"]), _int(g["scoreTeam2"])
+            if h + a > sum(best):
+                best = (h, a)
+    return best
+
+
+def merge_halftime(*cands: tuple[int, int] | None, score: tuple[int, int] | None = None) -> tuple[int, int] | None:
+    """Mehrere Quellen für den Pausenstand zusammenführen.
+
+    Tore verschwinden nicht → der Kandidat mit den meisten Toren gewinnt (bei Gleichstand der erste),
+    solange er nicht über dem aktuellen Spielstand liegt (VAR-Korrektur / Datenmüll).
+    """
+    present = [c for c in cands if c is not None]
+    if not present:
+        return None
+    valid = [c for c in present if score is None or (c[0] <= score[0] and c[1] <= score[1])]
+    if not valid:
+        return present[0]
+    best = valid[0]
+    for c in valid[1:]:
+        if sum(c) > sum(best):
+            best = c
+    return best
 
 
 def final_result(raw: dict) -> tuple[int, int] | None:
@@ -172,7 +213,7 @@ def current_score(raw: dict) -> tuple[tuple[int, int], bool]:
         candidates.append((_int(last["scoreTeam1"]), _int(last["scoreTeam2"])))
     if final:
         candidates.append(final)
-    ht = halftime_result(raw)
+    ht = _result(raw, HALFTIME_TYPE)
     if ht:
         candidates.append(ht)
     if not candidates:
